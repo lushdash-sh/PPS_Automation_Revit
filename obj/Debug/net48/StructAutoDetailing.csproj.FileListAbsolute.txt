@@ -1,0 +1,9 @@
+C:\Users\Shruti\StructAutoDetailing\bin\Debug\net48\StructAutoDetailing.dll
+C:\Users\Shruti\StructAutoDetailing\bin\Debug\net48\StructAutoDetailing.pdb
+C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.csproj.AssemblyReference.cache
+C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.AssemblyInfoInputs.cache
+C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.AssemblyInfo.cs
+C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.csproj.CoreCompileInputs.cache
+C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.dll
+C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.pdb

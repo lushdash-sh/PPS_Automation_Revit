@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>StructAuto Detailing UI</Name>
+    <Assembly>C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.dll</Assembly> <AddInId>b84a9e25-15a0-410a-814a-71eaec8b6c45</AddInId>
+    <FullClassName>StructAutoDetailing.App</FullClassName>
+    <VendorId>Shruti_Bhosale</VendorId>
+    <VendorDescription>Automated Structural Detailing</VendorDescription>
+  </AddIn>
+</RevitAddIns>
