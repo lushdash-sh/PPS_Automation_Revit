@@ -28,6 +28,10 @@ using Autodesk.Revit.DB.Structure;
 
 using StructAutoDetailing.Models;
 
+// Disambiguate: both StructAutoDetailing.Models and Autodesk.Revit.DB.Structure
+// declare a type named RebarBendData. In this file the domain model is always meant.
+using RebarBendData = StructAutoDetailing.Models.RebarBendData;
+
 namespace StructAutoDetailing.Parsers
 {
     public static class RebarCageAnalyzer
@@ -279,7 +283,7 @@ namespace StructAutoDetailing.Parsers
                 // ── Build the object ────────────────────────────────────────
                 var bar = new RebarCageBar
                 {
-                    RevitElementId     = elem.Id.IntegerValue,
+                    RevitElementId     = (int)elem.Id.Value,
                     DiameterMm         = diamMm,
                     AngleToVerticalDeg = angleDeg,
                     CentroidLocal      = new Vec3(centroidLocal.X, centroidLocal.Y, centroidLocal.Z),
@@ -325,7 +329,7 @@ namespace StructAutoDetailing.Parsers
             catch (Exception ex)
             {
                 colData.ParseWarnings.Add(
-                    $"Phase 2: Could not process rebar ElementId={elem.Id.IntegerValue}: {ex.Message}");
+                    $"Phase 2: Could not process rebar ElementId={(int)elem.Id.Value}: {ex.Message}");
                 return null;
             }
         }
@@ -355,103 +359,76 @@ namespace StructAutoDetailing.Parsers
         ///   • Ties at identical Z positions (concurrent placement) are de-duplicated.
         ///   • Zones with spacing > 200mm are labelled as standard (non-confinement).
         /// </summary>
+        /// <summary>Spacings are snapped to this increment (mm) before grouping.</summary>
+        private const int SPACING_SNAP_MM = 25;
+
+        /// <summary>Hard safety cap on the number of tie-zones / cross-sections.</summary>
+        private const int MAX_TIE_ZONES = 4;
+
         public static void ClusterTieZones(RebarPayload payload, PrecastColumnData colData)
         {
             List<RebarCageBar> ties = payload.TransverseBars;
             if (ties.Count == 0) return;
 
-            // De-duplicate ties at the exact same Z position
-            // (can happen when a rectangular link creates multiple Rebar elements
-            //  at the same height in some Revit family configurations)
+            // Collapse all ties that sit at the same level (perimeter link + cross-ties +
+            // diamond links share a height) down to one marker per level, so the gaps we
+            // measure are the real stirrup pitch — not the spacing between co-level legs.
             ties = DedupTiesByZ(ties);
 
-            var zones    = new List<RebarTieZone>();
-            var current  = new List<RebarCageBar>();
-            double referenceSpacing = -1; // -1 = unset (first bar)
-
-            for (int i = 0; i < ties.Count; i++)
+            if (ties.Count == 1)
             {
-                if (current.Count == 0)
-                {
-                    // Starting a new zone
-                    current.Add(ties[i]);
-                    referenceSpacing = -1;
-                    continue;
-                }
-
-                double spacing = ties[i].TieZPositionFt - current[current.Count - 1].TieZPositionFt;
-
-                // Guard: spacing should be positive (ties are sorted ascending)
-                if (spacing < 1e-6)
-                {
-                    // Near-zero spacing — duplicate at essentially same height
-                    // Keep the first one, skip this one
-                    colData.ParseWarnings.Add(
-                        $"Phase 2: Two ties at nearly identical Z " +
-                        $"({ties[i].TieZPositionMm:F0}mm). Duplicate skipped.");
-                    continue;
-                }
-
-                if (referenceSpacing < 0)
-                {
-                    // Second bar in a new zone — this establishes the reference spacing
-                    referenceSpacing = spacing;
-                    current.Add(ties[i]);
-                    continue;
-                }
-
-                // Check if this spacing matches the current zone's reference
-                if (Math.Abs(spacing - referenceSpacing) <= SPACING_TOLERANCE_FT)
-                {
-                    // Still in the same zone
-                    current.Add(ties[i]);
-                }
-                else
-                {
-                    // Spacing has changed — close the current zone
-                    zones.Add(BuildTieZone(current, referenceSpacing, zones.Count, colData));
-
-                    // Start a new zone with the current bar as the seed
-                    current = new List<RebarCageBar> { ties[i] };
-                    referenceSpacing = -1;
-                }
+                var only = BuildZoneFromRun(ties, 0, 0, 0, 0);
+                AssignZoneLabels(new List<RebarTieZone> { only }, colData);
+                only.ComputeMraText();
+                payload.TieZones.Add(only);
+                return;
             }
 
-            // Close the last open zone
-            if (current.Count > 0)
-                zones.Add(BuildTieZone(current, referenceSpacing, zones.Count, colData));
+            // Gaps between consecutive levels, snapped to the nearest 25 mm. Snapping +
+            // a median filter make the grouping robust to the small Z jitter that comes
+            // from using bounding-box centroids for each bar.
+            int n = ties.Count;
+            var gapMm = new int[n - 1];
+            for (int i = 0; i < n - 1; i++)
+            {
+                double g = (ties[i + 1].TieZPositionFt - ties[i].TieZPositionFt) * 304.8;
+                int snapped = (int)(Math.Round(g / SPACING_SNAP_MM) * SPACING_SNAP_MM);
+                gapMm[i] = Math.Max(snapped, SPACING_SNAP_MM);
+            }
+            gapMm = MedianSmooth(gapMm);
 
-            // Assign semantic labels and compute MRA text
+            // Group consecutive levels that share the same snapped gap into one zone.
+            var zones = new List<RebarTieZone>();
+            int runStart = 0; // index into ties
+            for (int i = 1; i < gapMm.Length; i++)
+            {
+                if (gapMm[i] != gapMm[i - 1])
+                {
+                    zones.Add(BuildZoneFromRun(ties, runStart, i, gapMm[runStart], zones.Count));
+                    runStart = i;
+                }
+            }
+            // Final run: gaps runStart..end correspond to ties runStart..n-1.
+            zones.Add(BuildZoneFromRun(ties, runStart, n - 1, gapMm[runStart], zones.Count));
+
+            // Absorb tiny noise zones (< 3 ties) into the adjacent zone, then cap the total.
+            zones = MergeSmallZones(zones);
+            zones = CapZones(zones, MAX_TIE_ZONES);
+
+            for (int i = 0; i < zones.Count; i++) zones[i].ZoneIndex = i;
             AssignZoneLabels(zones, colData);
-            foreach (var zone in zones)
-                zone.ComputeMraText();
-
-            // Populate the payload
+            foreach (var zone in zones) zone.ComputeMraText();
             payload.TieZones.AddRange(zones);
         }
 
         /// <summary>
-        /// Builds a single <see cref="RebarTieZone"/> from a collected list of bars
-        /// and a confirmed reference spacing.
+        /// Builds a <see cref="RebarTieZone"/> from ties[startIdx..endIdx] (inclusive),
+        /// using a known snapped centre-to-centre spacing (mm).
         /// </summary>
-        private static RebarTieZone BuildTieZone(
-            List<RebarCageBar> bars,
-            double referenceSpacingFt,
-            int index,
-            PrecastColumnData colData)
+        private static RebarTieZone BuildZoneFromRun(
+            List<RebarCageBar> ties, int startIdx, int endIdx, int spacingMm, int index)
         {
-            // For a single bar, spacing is undefined — emit with 0 spacing and warn
-            if (bars.Count == 1)
-            {
-                colData.ParseWarnings.Add(
-                    $"Phase 2: Single isolated tie at Z={bars[0].TieZPositionMm:F0}mm. " +
-                    "Cannot determine spacing. Check the model for a missing adjacent tie.");
-            }
-
-            double spacingFt = bars.Count > 1
-                ? referenceSpacingFt
-                : 0;
-
+            var bars = ties.GetRange(startIdx, endIdx - startIdx + 1);
             int tieDiamMm = bars
                 .GroupBy(b => b.DiameterMm)
                 .OrderByDescending(g => g.Count())
@@ -464,11 +441,78 @@ namespace StructAutoDetailing.Parsers
                 StartZFt      = bars.First().TieZPositionFt,
                 EndZFt        = bars.Last().TieZPositionFt,
                 Count         = bars.Count,
-                SpacingFt     = spacingFt,
+                SpacingFt     = spacingMm / 304.8,
                 TieDiameterMm = tieDiamMm,
             };
             zone.Bars.AddRange(bars);
             return zone;
+        }
+
+        /// <summary>Median-of-three filter: removes isolated single-gap spikes.</summary>
+        private static int[] MedianSmooth(int[] a)
+        {
+            if (a.Length < 3) return a;
+            var r = (int[])a.Clone();
+            for (int i = 1; i < a.Length - 1; i++)
+            {
+                int x = a[i - 1], y = a[i], z = a[i + 1];
+                r[i] = Math.Max(Math.Min(x, y), Math.Min(Math.Max(x, y), z)); // median(x,y,z)
+            }
+            return r;
+        }
+
+        /// <summary>Merges zones with fewer than 3 ties into the adjacent zone with the
+        /// closest spacing (keeping the surviving zone's spacing).</summary>
+        private static List<RebarTieZone> MergeSmallZones(List<RebarTieZone> zones)
+        {
+            bool changed = true;
+            while (changed && zones.Count > 1)
+            {
+                changed = false;
+                for (int i = 0; i < zones.Count; i++)
+                {
+                    if (zones[i].Count >= 3) continue;
+                    int j;
+                    if (i == 0) j = 1;
+                    else if (i == zones.Count - 1) j = i - 1;
+                    else j = Math.Abs(zones[i - 1].SpacingMm - zones[i].SpacingMm) <=
+                             Math.Abs(zones[i + 1].SpacingMm - zones[i].SpacingMm) ? i - 1 : i + 1;
+                    AbsorbZone(zones, keep: j, drop: i);
+                    changed = true;
+                    break;
+                }
+            }
+            return zones;
+        }
+
+        /// <summary>Reduces the zone count to <paramref name="max"/> by repeatedly merging
+        /// the adjacent pair whose spacings are most similar.</summary>
+        private static List<RebarTieZone> CapZones(List<RebarTieZone> zones, int max)
+        {
+            while (zones.Count > max)
+            {
+                int bestI = 0; double bestDiff = double.MaxValue;
+                for (int i = 0; i < zones.Count - 1; i++)
+                {
+                    double diff = Math.Abs(zones[i].SpacingMm - zones[i + 1].SpacingMm);
+                    if (diff < bestDiff) { bestDiff = diff; bestI = i; }
+                }
+                AbsorbZone(zones, keep: bestI, drop: bestI + 1);
+            }
+            return zones;
+        }
+
+        /// <summary>Folds the <paramref name="drop"/> zone's ties into the <paramref name="keep"/>
+        /// zone (must be adjacent) and removes the dropped zone.</summary>
+        private static void AbsorbZone(List<RebarTieZone> zones, int keep, int drop)
+        {
+            RebarTieZone k = zones[keep], d = zones[drop];
+            k.Bars.AddRange(d.Bars);
+            k.Bars.Sort((a, b) => a.TieZPositionFt.CompareTo(b.TieZPositionFt));
+            k.StartZFt = Math.Min(k.StartZFt, d.StartZFt);
+            k.EndZFt   = Math.Max(k.EndZFt, d.EndZFt);
+            k.Count    = k.Bars.Count;
+            zones.RemoveAt(drop);
         }
 
         /// <summary>
@@ -551,7 +595,7 @@ namespace StructAutoDetailing.Parsers
                 .ToList();
 
             // Map ElementId → Element for bending dimension extraction
-            var elementMap = rebarElements.ToDictionary(e => e.Id.IntegerValue, e => e);
+            var elementMap = rebarElements.ToDictionary(e => (int)e.Id.Value, e => e);
 
             foreach (var group in markGroups)
             {
@@ -737,12 +781,15 @@ namespace StructAutoDetailing.Parsers
                 // ── Get the bar's curve set in its LOCAL frame ──────────────
                 // GetCenterlineCurves returns the bar path as a list of curves.
                 // For a shape-driven bar this is the definitive geometry source.
+                // Positional args (Revit 2027 names the 2nd param suppressHooksAndCranks):
+                //   adjustForSelfIntersection=false, suppressHooksAndCranks=false,
+                //   suppressBendRadius=true, multiplanarOption, barPositionIndex=0
                 IList<Curve> centerlineCurves = rebar.GetCenterlineCurves(
-                    adjustForSelfIntersection: false,
-                    suppressHooks:             false,
-                    suppressBendRadius:        true,   // remove bend rounding for dimension accuracy
-                    multiplanarOption:         MultiplanarOption.IncludeAllMultiplanarCurves,
-                    rebarIndex:                0);
+                    false,
+                    false,
+                    true,   // remove bend rounding for dimension accuracy
+                    MultiplanarOption.IncludeAllMultiplanarCurves,
+                    0);
 
                 if (centerlineCurves == null || centerlineCurves.Count == 0)
                 {
@@ -759,9 +806,8 @@ namespace StructAutoDetailing.Parsers
                     .ToList();
 
                 schedRow.Dims = MapSegmentsToABCD(segmentLengthsMm, schedRow, rebar, colData);
-                schedRow.RevitShapeName = rebar.RebarShapeId != ElementId.InvalidElementId
-                    ? (doc_GetElement_Safe(colData, rebar.RebarShapeId)?.Name ?? string.Empty)
-                    : string.Empty;
+                // Shape name is cosmetic and the Document isn't threaded here; leave blank.
+                schedRow.RevitShapeName = string.Empty;
             }
             catch (Exception ex)
             {
@@ -932,7 +978,7 @@ namespace StructAutoDetailing.Parsers
                 try
                 {
                     // Shape-driven bars (the common case for individually placed rebar)
-                    if (rebar.IsShapeDriven())
+                    if (rebar.IsRebarShapeDriven())
                     {
                         var accessor = rebar.GetShapeDrivenAccessor();
                         Transform barTransform = accessor.GetBarPositionTransform(0);
@@ -952,7 +998,9 @@ namespace StructAutoDetailing.Parsers
 
             if (elem is RebarInSystem ris)
             {
-                try { return ris.GetTransform().BasisX.Normalize(); }
+                // RebarInSystem has no GetTransform(); the per-bar position transform
+                // gives the bar's local frame, whose BasisX is the primary axis.
+                try { return ris.GetBarPositionTransform(0).BasisX.Normalize(); }
                 catch { /* fall through */ }
             }
 
@@ -979,7 +1027,7 @@ namespace StructAutoDetailing.Parsers
                 return (bb.Min + bb.Max) / 2.0;
 
             // If no bounding box (unusual), try to get from curves
-            if (elem is Rebar rebar && rebar.IsShapeDriven())
+            if (elem is Rebar rebar && rebar.IsRebarShapeDriven())
             {
                 try
                 {
@@ -1010,7 +1058,7 @@ namespace StructAutoDetailing.Parsers
                 return lenParam.AsDouble();
 
             // Fallback: sum centerline curves
-            if (elem is Rebar rebar && rebar.IsShapeDriven())
+            if (elem is Rebar rebar && rebar.IsRebarShapeDriven())
             {
                 try
                 {
@@ -1042,24 +1090,27 @@ namespace StructAutoDetailing.Parsers
             if (dParam != null && dParam.HasValue)
                 return (int)Math.Round(dParam.AsDouble() * 304.8);
 
-            // RebarType.BarDiameter property
+            // RebarBarType.BarNominalDiameter (Rebar has no BarType property in 2027 —
+            // resolve the type element via GetTypeId()).
             if (elem is Rebar rebar)
             {
                 try
                 {
-                    return (int)Math.Round(rebar.BarType.BarDiameter * 304.8);
+                    var barType = elem.Document.GetElement(rebar.GetTypeId()) as RebarBarType;
+                    if (barType != null)
+                        return (int)Math.Round(barType.BarNominalDiameter * 304.8);
                 }
                 catch { /* fall through */ }
             }
 
-            // RebarInSystem — try its BarType
+            // RebarInSystem — resolve its bar type the same way.
             if (elem is RebarInSystem ris)
             {
                 try
                 {
-                    RebarBarType barType = ris.Document.GetElement(ris.BarTypeId) as RebarBarType;
+                    RebarBarType barType = ris.Document.GetElement(ris.GetTypeId()) as RebarBarType;
                     if (barType != null)
-                        return (int)Math.Round(barType.BarDiameter * 304.8);
+                        return (int)Math.Round(barType.BarNominalDiameter * 304.8);
                 }
                 catch { /* fall through */ }
             }
@@ -1073,7 +1124,9 @@ namespace StructAutoDetailing.Parsers
 
         private static List<RebarCageBar> DedupTiesByZ(List<RebarCageBar> ties)
         {
-            const double DEDUP_TOLERANCE_FT = 2.0 / 304.8; // 2mm
+            // Ties closer than this in Z are treated as the same level (perimeter link +
+            // cross-ties + diamond links). 30 mm is well under the smallest real pitch.
+            const double DEDUP_TOLERANCE_FT = 30.0 / 304.8;
             var result = new List<RebarCageBar> { ties[0] };
 
             for (int i = 1; i < ties.Count; i++)

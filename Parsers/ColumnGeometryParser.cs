@@ -134,7 +134,10 @@ namespace StructAutoDetailing.Parsers
             Solid columnSolid = ParseSolidGeometry(colInstance, colData, doc);
 
             // ── Phase 1C: Corbel detection ─────────────────────────────────
-            ParseCorbels(columnSolid, colData);
+            // Slice in the SAME local frame the LocalBBox was measured in (the instance
+            // transform), otherwise the slice Z range and the edge Z range don't line up
+            // and no cross-section intersections are found.
+            ParseCorbels(columnSolid, colData, colInstance.GetTransform().Inverse);
 
             // ── Phase 1D: Embedded element classification ──────────────────
             ParseEmbeds(doc, colInstance, colData);
@@ -304,9 +307,8 @@ namespace StructAutoDetailing.Parsers
         /// Side-effect: refines <c>colData.ShaftWidthFt</c> and <c>ShaftDepthFt</c>
         /// to the minimum cross-section (the pure shaft dims, excluding corbels).
         /// </summary>
-        private static void ParseCorbels(Solid columnSolid, PrecastColumnData colData)
+        private static void ParseCorbels(Solid columnSolid, PrecastColumnData colData, Transform worldToLocal)
         {
-            Transform worldToLocal = GetWorldToLocalTransform(colData);
 
             double minZ = colData.LocalBBox.MinZ;
             double maxZ = colData.LocalBBox.MaxZ;

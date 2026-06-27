@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "FKZQwn0fDUw=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\Shruti\\StructAutoDetailing\\.reflect7\\r.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Shruti\\.nuget\\packages\\system.reflection.metadataloadcontext\\8.0.0\\system.reflection.metadataloadcontext.8.0.0.nupkg.sha512"
+  ],
+  "logs": []
+}

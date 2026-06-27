@@ -2,19 +2,18 @@
 //  StructAuto Detailing — Command Entry Point
 //  File:    Commands/GenerateSheetsCommand.cs
 //
-//  This is the IExternalCommand.Execute implementation.
-//  Currently wired for Phase 0 + Phase 1 ONLY (geometry parse and debug output).
-//  Phases 2–5 will be uncommented / added in subsequent sprints.
+//  Pipeline on click:
+//    1. Pick — restricted to structural Column / Beam / Wall (pick filter).
+//    2. Phase 1 — geometry parse        (read-only)
+//    3. Phase 2 — rebar cage analysis   (read-only)
+//    4. Phases 3–5 — views, dimensions, sheets (inside a TransactionGroup)
 //
-//  To register this command, add to your Application.cs:
-//      panel.AddItem(new PushButtonData(
-//          "GenerateSheets",
-//          "Generate\nSheets",
-//          Assembly.GetExecutingAssembly().Location,
-//          "StructAutoDetailing.Commands.GenerateSheetsCommand"));
+//  Only columns are detailed in this build; picking a beam or wall is reported as
+//  "not yet supported".
 // =============================================================================
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 
 using Autodesk.Revit.Attributes;
@@ -22,7 +21,6 @@ using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
 using Autodesk.Revit.UI.Selection;
 
-using System.Linq;
 using StructAutoDetailing.Models;
 using StructAutoDetailing.Parsers;
 
@@ -41,49 +39,51 @@ namespace StructAutoDetailing
             UIDocument    uidoc = uiApp.ActiveUIDocument;
             Document      doc   = uidoc.Document;
 
-            // ── Step 1: Prompt user to select a column ─────────────────────
+            // ── Step 1: Pick a main element (column/beam/wall) ─────────────────
             Reference pickedRef;
             try
             {
                 pickedRef = uidoc.Selection.PickObject(
                     ObjectType.Element,
-                    new PrecastColumnSelectionFilter(),
-                    "StructAuto: Click a Precast Column to generate shop drawings");
+                    new MainElementSelectionFilter(),
+                    "StructAuto: Click a Column (Beam/Wall not yet supported) to generate shop drawings");
             }
             catch (Autodesk.Revit.Exceptions.OperationCanceledException)
             {
-                // User pressed Escape — not an error
+                return Result.Cancelled; // Escape — not an error
+            }
+
+            // ── Only columns are detailed in this build ────────────────────────
+            Element picked = doc.GetElement(pickedRef.ElementId);
+            if (!MainElementSelectionFilter.IsColumn(picked))
+            {
+                TaskDialog.Show("StructAuto — Not Yet Supported",
+                    $"'{picked?.Category?.Name}' elements are not detailed yet.\n\n" +
+                    "This build generates Formwork and Reinforcement sheets for precast columns only. " +
+                    "Beam and wall support is planned for a later sprint.");
                 return Result.Cancelled;
             }
 
-            // ── Step 2: Parse geometry (Phase 0 + Phase 1) ────────────────
+            // ── Step 2: Phase 1 — geometry parse (read-only) ───────────────────
             PrecastColumnData colData;
             try
             {
-                // Phase 1 has no Revit writes — no transaction needed for parsing.
-                // (BoundingBoxIntersectsFilter reads are always safe outside transactions.)
                 colData = ColumnGeometryParser.Parse(doc, pickedRef.ElementId);
             }
             catch (PrecastEngineException pex)
             {
-                // Known, user-facing errors (inclined column, no geometry, etc.)
-                TaskDialog.Show(
-                    "StructAuto — Cannot Process Element",
-                    pex.Message);
+                TaskDialog.Show("StructAuto — Cannot Process Element", pex.Message);
                 return Result.Failed;
             }
             catch (Exception ex)
             {
-                // Unexpected API error — show full detail so developer can diagnose
-                TaskDialog.Show(
-                    "StructAuto — Unexpected Error in Phase 1",
-                    $"An unexpected error occurred during geometry parsing:\n\n" +
-                    $"{ex.GetType().Name}: {ex.Message}\n\n" +
+                TaskDialog.Show("StructAuto — Unexpected Error in Phase 1",
+                    $"Geometry parsing failed:\n\n{ex.GetType().Name}: {ex.Message}\n\n" +
                     $"Stack trace (top):\n{ex.StackTrace?.Split('\n').FirstOrDefault()}");
                 return Result.Failed;
             }
 
-            // ── Step 3: Phase 2 — Rebar analysis (read-only, no transaction) ──
+            // ── Step 3: Phase 2 — rebar analysis (read-only) ───────────────────
             try
             {
                 colData.Rebar = RebarCageAnalyzer.Analyze(doc, colData);
@@ -95,92 +95,137 @@ namespace StructAutoDetailing
             }
             catch (Exception ex)
             {
-                TaskDialog.Show(
-                    "StructAuto — Unexpected Error in Phase 2",
+                TaskDialog.Show("StructAuto — Unexpected Error in Phase 2",
                     $"Rebar analysis failed:\n\n{ex.GetType().Name}: {ex.Message}\n\n" +
                     $"Stack trace (top):\n{ex.StackTrace?.Split('\n').FirstOrDefault()}");
                 return Result.Failed;
             }
 
-            // ── Step 4: Show combined debug summary ─────────────────────
-            ParseDiagnostics.ShowParseSummary(uiApp, colData);
+            // ── Step 4: Phases 3–5 — views, dimensions, sheets ─────────────────
+            List<ColumnView> createdViews = new List<ColumnView>();
+            SheetBuildResult sheets = new SheetBuildResult();
+            using (var tg = new TransactionGroup(doc, "StructAuto: Generate Column Shop Drawings"))
+            {
+                try
+                {
+                    tg.Start();
 
-            // ── Step 5 (FUTURE): Phases 3–5 — View creation and sheet assembly ──
-            // using (var tg = new TransactionGroup(doc, "StructAuto: Generate Shop Drawings"))
-            // {
-            //     tg.Start();
-            //     ...Phases 3–5 go here...
-            //     tg.Assemble();
-            // }
+                    using (var t = new Transaction(doc, "StructAuto: Create Views"))
+                    {
+                        t.Start();
+                        createdViews = ViewFactory.CreateViews(doc, colData);
+                        t.Commit();
+                    }
 
-            // ── Temporary success message ──────────────────────────────────
-            var rebar = colData.Rebar;
-            TaskDialog.Show(
-                "StructAuto — Phase 1 + 2 Complete",
-                $"Column '{colData.ElementMark}' — geometry and rebar parsed successfully.\n\n" +
-                $"── Geometry ──────────────────────────\n" +
-                $"Shaft:   {colData.ShaftWidthMm:F0} × {colData.ShaftDepthMm:F0} × {colData.TotalHeightMm:F0} mm\n" +
-                $"Base EL: {colData.BaseElevationM:F3} m  |  Top EL: {colData.TopElevationM:F3} m\n" +
-                $"Volume:  {colData.VolumeM3:F2} m³  |  Est. Weight: {colData.WeightTonnes:F2} T\n\n" +
-                $"── Embeds ────────────────────────────\n" +
-                $"Corbels: {colData.Corbels.Count}  |  Sleeves: {colData.CorrugatedSleeves.Count}\n" +
-                $"Lifters: {colData.Lifters.Count}  |  Dowels:  {colData.DowelBars.Count}\n\n" +
-                $"── Rebar ─────────────────────────────\n" +
-                $"Longitudinal bars: {rebar.LongitudinalBars.Count}\n" +
-                $"Transverse bars:   {rebar.TransverseBars.Count}\n" +
-                $"Tie zones:         {rebar.TieZones.Count}\n" +
-                $"Schedule rows:     {rebar.BendSchedule.Count}\n" +
-                $"Total rebar wt:    {rebar.TotalWeightFormatted}\n\n" +
-                $"Tie zones:\n" +
-                string.Join("\n", rebar.TieZones.Select(z =>
-                    $"  [{z.ZoneIndex + 1}] {z.MraTagText}  T{z.TieDiameterMm}  " +
-                    $"Z={z.StartZMm:F0}–{z.EndZMm:F0}mm")) + "\n\n" +
-                $"Warnings: {colData.ParseWarnings.Count}\n\n" +
-                "View and sheet generation (Phases 3–5) will be enabled in the next build.");
+                    using (var t = new Transaction(doc, "StructAuto: Annotate Views"))
+                    {
+                        t.Start();
+                        DimensionFactory.Annotate(doc, colData, createdViews);
+                        t.Commit();
+                    }
 
+                    using (var t = new Transaction(doc, "StructAuto: Assemble Sheets"))
+                    {
+                        t.Start();
+                        sheets = SheetBuilder.Build(doc, colData, createdViews);
+                        t.Commit();
+                    }
+
+                    tg.Assimilate();
+                }
+                catch (Exception ex)
+                {
+                    if (tg.GetStatus() == TransactionStatus.Started) tg.RollBack();
+                    TaskDialog.Show("StructAuto — View/Sheet Generation Failed",
+                        $"{ex.GetType().Name}: {ex.Message}\n\n" +
+                        $"Stack trace (top):\n{ex.StackTrace?.Split('\n').FirstOrDefault()}");
+                    return Result.Failed;
+                }
+            }
+
+            // ── Step 5: Result summary ─────────────────────────────────────────
+            ShowResult(colData, createdViews, sheets);
             return Result.Succeeded;
+        }
+
+        private static void ShowResult(PrecastColumnData colData, List<ColumnView> views, SheetBuildResult sheets)
+        {
+            int sections = views.Count(v => v.Kind == ViewKind.CrossSection &&
+                                            v.Variant == SheetVariant.Formwork);
+
+            var td = new TaskDialog("StructAuto — Sheets Generated")
+            {
+                MainInstruction = $"Column '{colData.ElementMark}' — shop drawings generated",
+                MainContent =
+                    $"Formwork sheet:      {sheets.FormworkSheetNumber ?? "(failed)"}\n" +
+                    $"Reinforcement sheet: {sheets.ReinforcementSheetNumber ?? "(failed)"}\n\n" +
+                    $"Views created:   {views.Count}  ({sections} cross-section(s) per sheet)\n" +
+                    $"Viewports placed: {sheets.ViewportsPlaced}\n\n" +
+                    $"Shaft: {colData.ShaftWidthMm:F0} × {colData.ShaftDepthMm:F0} × {colData.TotalHeightMm:F0} mm   " +
+                    $"Tie zones: {colData.Rebar?.TieZones.Count ?? 0}\n\n" +
+                    $"Warnings: {colData.ParseWarnings.Count} " +
+                    (colData.ParseWarnings.Count > 0
+                        ? "(specialized dimensions / fragile references — complete manually)"
+                        : "")
+            };
+
+            if (colData.ParseWarnings.Count > 0)
+            {
+                td.ExpandedContent = string.Join("\n",
+                    colData.ParseWarnings.Take(40).Select((w, i) => $"  {i + 1}. {w}"));
+            }
+            td.CommonButtons = TaskDialogCommonButtons.Ok;
+            td.Show();
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  SELECTION FILTER
+    //  SELECTION FILTER  — Column / Beam / Wall
     // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Restricts the PickObject prompt to structural column FamilyInstances only.
-    /// The filter checks both the structural type and the BuiltInCategory so it
-    /// accepts precast columns placed in either the Structural Columns or the
-    /// Specialty Equipment category (common in some precast workflows).
+    /// Restricts picking to the structural main elements: columns, beams
+    /// (structural framing) and walls. Columns also accept the Specialty Equipment
+    /// and Generic Model categories used by some precast families.
     /// </summary>
-    public class PrecastColumnSelectionFilter : ISelectionFilter
+    public class MainElementSelectionFilter : ISelectionFilter
     {
         public bool AllowElement(Element elem)
         {
-            if (elem == null) return false;
+            if (elem?.Category == null) return false;
+            long cat = elem.Category.Id.Value;
 
-            // Must be a FamilyInstance
-            if (!(elem is FamilyInstance fi)) return false;
+            if (cat == (long)(int)BuiltInCategory.OST_StructuralColumns) return true;
+            if (cat == (long)(int)BuiltInCategory.OST_StructuralFraming) return true; // beams
+            if (cat == (long)(int)BuiltInCategory.OST_Walls)             return true;
 
-            // Accept structural columns
-            if (elem.Category?.Id.IntegerValue == (int)BuiltInCategory.OST_StructuralColumns)
-                return true;
-
-            // Also accept Specialty Equipment (some precast families use this category)
-            if (elem.Category?.Id.IntegerValue == (int)BuiltInCategory.OST_SpecialityEquipment)
-                return true;
-
-            // Accept Generic Models that have a "Precast" or "Column" keyword in family name
-            // (permissive fallback for non-standard family categorisation)
-            if (elem.Category?.Id.IntegerValue == (int)BuiltInCategory.OST_GenericModel)
+            // Precast columns occasionally live in these categories.
+            if (cat == (long)(int)BuiltInCategory.OST_SpecialityEquipment ||
+                cat == (long)(int)BuiltInCategory.OST_GenericModel)
             {
-                string famName = (fi.Symbol?.FamilyName ?? string.Empty).ToUpperInvariant();
+                string famName = ((elem as FamilyInstance)?.Symbol?.FamilyName ?? string.Empty).ToUpperInvariant();
                 if (famName.Contains("PRECAST") || famName.Contains("COLUMN") || famName.Contains("FPC"))
                     return true;
             }
-
             return false;
         }
 
         public bool AllowReference(Reference reference, XYZ position) => false;
+
+        /// <summary>True if the element is (or behaves as) a precast column.</summary>
+        public static bool IsColumn(Element elem)
+        {
+            if (elem?.Category == null) return false;
+            long cat = elem.Category.Id.Value;
+            if (cat == (long)(int)BuiltInCategory.OST_StructuralColumns) return true;
+
+            if (cat == (long)(int)BuiltInCategory.OST_SpecialityEquipment ||
+                cat == (long)(int)BuiltInCategory.OST_GenericModel)
+            {
+                string famName = ((elem as FamilyInstance)?.Symbol?.FamilyName ?? string.Empty).ToUpperInvariant();
+                return famName.Contains("PRECAST") || famName.Contains("COLUMN") || famName.Contains("FPC");
+            }
+            return false;
+        }
     }
 }

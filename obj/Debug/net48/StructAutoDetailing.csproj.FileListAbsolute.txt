@@ -7,3 +7,4 @@ C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.Assembly
 C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.csproj.CoreCompileInputs.cache
 C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.dll
 C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.pdb
+C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.sourcelink.json

@@ -8,37 +8,46 @@ namespace StructAutoDetailing
     {
         public Result OnStartup(UIControlledApplication application)
         {
-            // 1. Create a custom ribbon tab
-            string tabName = "StructAuto";
+            const string tabName = "PPS Shop Tools";
             application.CreateRibbonTab(tabName);
 
-            // 2. Create a ribbon panel inside that tab
-            RibbonPanel detailingPanel = application.CreateRibbonPanel(tabName, "Detailing");
+            // The workflow is split into focused steps, each its own button.
+            RibbonPanel panel = application.CreateRibbonPanel(tabName, "Precast Column");
+            string asm = Assembly.GetExecutingAssembly().Location;
 
-            // 3. Get the path of the current DLL so Revit knows where to find the execution code
-            string thisAssemblyPath = Assembly.GetExecutingAssembly().Location;
+            AddButton(panel, asm,
+                "cmdCreateElevation", "Create\nElevation",
+                "StructAutoDetailing.CreateElevationCommand",
+                "Pick a precast column and create its Front and Side elevation views.");
 
-            // 4. Create the button data
-            // Parameters: Internal Name, Display Text, Assembly Path, Namespace.ClassName of the command
-            PushButtonData buttonData = new PushButtonData(
-                "cmdGenerateSheets",
-                "Generate\nSheets",
-                thisAssemblyPath,
-                "StructAutoDetailing.GenerateSheetsCommand");
+            AddButton(panel, asm,
+                "cmdCreateSections", "Create\nSections",
+                "StructAutoDetailing.CreateSectionsCommand",
+                "Pick a precast column and create cut-section views where the reinforcement changes.");
 
-            // 5. Add the button to the panel
-            PushButton generateButton = detailingPanel.AddItem(buttonData) as PushButton;
+            panel.AddSeparator();
 
-            // Optional: Add a tooltip so the user knows what it does
-            generateButton.ToolTip = "Automatically generates Formwork and Reinforcement sheets for selected elements.";
+            AddButton(panel, asm,
+                "cmdSmartDim", "Smart\nDimensioning",
+                "StructAutoDetailing.SmartDimensioningCommand",
+                "Add standard dimensions to a generated view, using a reference line you pick.");
+
+            AddButton(panel, asm,
+                "cmdGenerateSheets", "Generate\nSheets",
+                "StructAutoDetailing.GenerateSheetsCommand",
+                "Assemble the generated views onto Formwork and Reinforcement sheets.");
 
             return Result.Succeeded;
         }
 
-        public Result OnShutdown(UIControlledApplication application)
+        public Result OnShutdown(UIControlledApplication application) => Result.Succeeded;
+
+        private static void AddButton(RibbonPanel panel, string assemblyPath,
+            string internalName, string text, string className, string tooltip)
         {
-            // Nothing needed here for now
-            return Result.Succeeded;
+            var data = new PushButtonData(internalName, text, assemblyPath, className);
+            if (panel.AddItem(data) is PushButton btn)
+                btn.ToolTip = tooltip;
         }
     }
 }
