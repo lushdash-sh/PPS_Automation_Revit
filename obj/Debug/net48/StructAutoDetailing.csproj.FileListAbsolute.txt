@@ -8,3 +8,13 @@ C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.csproj.C
 C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.dll
 C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.pdb
 C:\Users\Shruti\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.sourcelink.json
+C:\Engineering\StructAutoDetailing\bin\Debug\net48\StructAutoDetailing.dll
+C:\Engineering\StructAutoDetailing\bin\Debug\net48\StructAutoDetailing.pdb
+C:\Engineering\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.csproj.AssemblyReference.cache
+C:\Engineering\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.GeneratedMSBuildEditorConfig.editorconfig
+C:\Engineering\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.AssemblyInfoInputs.cache
+C:\Engineering\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.AssemblyInfo.cs
+C:\Engineering\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.csproj.CoreCompileInputs.cache
+C:\Engineering\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.sourcelink.json
+C:\Engineering\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.dll
+C:\Engineering\StructAutoDetailing\obj\Debug\net48\StructAutoDetailing.pdb

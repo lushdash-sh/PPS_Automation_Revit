@@ -13,11 +13,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Users\\Shruti\\StructAutoDetailing\\StructAutoDetailing.csproj",
+      "projectUniqueName": "C:\\Engineering\\StructAutoDetailing\\StructAutoDetailing.csproj",
       "projectName": "StructAutoDetailing",
-      "projectPath": "C:\\Users\\Shruti\\StructAutoDetailing\\StructAutoDetailing.csproj",
+      "projectPath": "C:\\Engineering\\StructAutoDetailing\\StructAutoDetailing.csproj",
       "packagesPath": "C:\\Users\\Shruti\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\Shruti\\StructAutoDetailing\\obj\\",
+      "outputPath": "C:\\Engineering\\StructAutoDetailing\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
         "C:\\Users\\Shruti\\AppData\\Roaming\\NuGet\\NuGet.Config"
