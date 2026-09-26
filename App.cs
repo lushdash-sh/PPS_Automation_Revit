@@ -9,33 +9,45 @@ namespace StructAutoDetailing
         public Result OnStartup(UIControlledApplication application)
         {
             const string tabName = "PPS Shop Tools";
-            application.CreateRibbonTab(tabName);
+            
+            // Try-catch prevents crashes if the tab already exists
+            try { application.CreateRibbonTab(tabName); } catch { }
 
-            // The workflow is split into focused steps, each its own button.
-            RibbonPanel panel = application.CreateRibbonPanel(tabName, "Precast Column");
             string asm = Assembly.GetExecutingAssembly().Location;
 
-            AddButton(panel, asm,
+            // COLUMN PANEL
+            RibbonPanel columnPanel = application.CreateRibbonPanel(tabName, "Precast Column");
+
+            AddButton(columnPanel, asm,
                 "cmdCreateElevation", "Create\nElevation",
                 "StructAutoDetailing.CreateElevationCommand",
                 "Pick a precast column and create its Front and Side elevation views.");
 
-            AddButton(panel, asm,
+            AddButton(columnPanel, asm,
                 "cmdCreateSections", "Create\nSections",
                 "StructAutoDetailing.CreateSectionsCommand",
                 "Pick a precast column and create cut-section views where the reinforcement changes.");
 
-            panel.AddSeparator();
+            columnPanel.AddSeparator();
 
-            AddButton(panel, asm,
+            AddButton(columnPanel, asm,
                 "cmdSmartDim", "Smart\nDimensioning",
                 "StructAutoDetailing.SmartDimensioningCommand",
                 "Add standard dimensions to a generated view, using a reference line you pick.");
 
-            AddButton(panel, asm,
+            AddButton(columnPanel, asm,
                 "cmdGenerateSheets", "Generate\nSheets",
                 "StructAutoDetailing.GenerateSheetsCommand",
                 "Assemble the generated views onto Formwork and Reinforcement sheets.");
+
+
+            // WALL PANEL
+            RibbonPanel wallPanel = application.CreateRibbonPanel(tabName, "Precast Wall");
+            
+            AddButton(wallPanel, asm,
+                "cmdSmartWallDim", "Smart Wall\nDimensioning",
+                "StructAutoDetailing.WallDimensioningCommand",
+                "Automatically dimension overall length and height of walls in the current view.");
 
             return Result.Succeeded;
         }
