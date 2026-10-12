@@ -10,41 +10,30 @@ namespace StructAutoDetailing
         {
             const string tabName = "PPS Shop Tools";
             
-            // Try-catch prevents crashes if the tab already exists
             try { application.CreateRibbonTab(tabName); } catch { }
 
             string asm = Assembly.GetExecutingAssembly().Location;
 
-            AddButton(panel, asm,
-                "cmdCreateElevation", "Create\nElevation",
-                "StructAutoDetailing.CreateElevationCommand",
-                "Pick a precast column and create its Front and Side elevation views.");
-
-            AddButton(panel, asm,
-                "cmdCreateSections", "Create\nSections",
-                "StructAutoDetailing.CreateSectionsCommand",
-                "Pick a precast column and create cut-section views where the reinforcement changes.");
-
-            panel.AddSeparator();
-
-            AddButton(panel, asm,
-                "cmdSmartDim", "Smart\nDimensioning",
+            // 1. COLUMN PANEL
+            RibbonPanel columnPanel = application.CreateRibbonPanel(tabName, "Smart Column Dimensioning");
+            AddButton(columnPanel, asm,
+                "cmdSmartDim", "Smart Column\nDimensioning",
                 "StructAutoDetailing.SmartDimensioningCommand",
-                "Add standard dimensions to a generated view, using a reference line you pick.");
+                "Add standard multi-tier dimensions to a column assembly view.");
 
-            AddButton(panel, asm,
-                "cmdGenerateSheets", "Generate\nSheets",
-                "StructAutoDetailing.GenerateSheetsCommand",
-                "Assemble the generated views onto Formwork and Reinforcement sheets.");
+            // 2. BEAM PANEL
+            RibbonPanel beamPanel = application.CreateRibbonPanel(tabName, "Smart Beam Dimensioning");
+            AddButton(beamPanel, asm,
+                "cmdSmartBeamDim", "Smart Beam\nDimensioning",
+                "StructAutoDetailing.SmartBeamDimensioningCommand",
+                "Automatically dimension overall length, depth, and embeds of a beam.");
 
-
-            // WALL PANEL
+            // 3. WALL PANEL
             RibbonPanel wallPanel = application.CreateRibbonPanel(tabName, "Precast Wall");
-            
             AddButton(wallPanel, asm,
                 "cmdSmartWallDim", "Smart Wall\nDimensioning",
                 "StructAutoDetailing.WallDimensioningCommand",
-                "Automatically dimension overall length and height of walls in the current view.");
+                "Automatically dimension overall length and height of walls.");
 
             return Result.Succeeded;
         }
