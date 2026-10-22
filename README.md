@@ -110,14 +110,14 @@ project file, which must exist on the build machine.
 2. Ensure the view is clear of previous manual dimensioning. The beam command
    can clean up its own previous runs.
 3. Open the **PPS Shop Tools** ribbon tab.
-4. Click **Smart Column Dimensioning** or **Smart Beam Dimensioning**.
+4. Click **Smart Column Dimensioning**, **Smart Wall Dimensioning** or **Smart Beam Dimensioning**.
 5. When prompted, select the main precast assembly in the view.
 6. The command processes the assembly geometry and places dimension tiers
    according to the implemented detailing rules.
 
 ## Current progress and scope
 
-- **Columns and walls:** In progress. The current effort uses raw 3D geometry
+- **Columns and walls:** In progress. The current effort uses reference planes as a source of detecting the dimensions. We plan to implement geometry
   to detect concrete dimensions and nested embeds, including corbels, lifting
   hooks, and dowels, for automated dimension tiers.
 - **Beams:** Elevation-view dimensioning is also in progress.
