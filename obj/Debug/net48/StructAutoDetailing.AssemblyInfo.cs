@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("StructAutoDetailing")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+5020221731a8db2107e6d9a3cb78eae88341c904")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e707697ffbc5f2e35ab34ce97a8f94c418e8fbbc")]
 [assembly: System.Reflection.AssemblyProductAttribute("StructAutoDetailing")]
 [assembly: System.Reflection.AssemblyTitleAttribute("StructAutoDetailing")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

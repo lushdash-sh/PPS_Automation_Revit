@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using Autodesk.Revit.Attributes;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
@@ -11,6 +12,57 @@ namespace StructAutoDetailing
     [Transaction(TransactionMode.Manual)]
     public class SmartDimensioningCommand : IExternalCommand
     {
+        // =====================================================================
+        //  SETTINGS - tweak these instead of hunting through the code
+        // =====================================================================
+
+        // Distances below are PAPER millimetres. They are multiplied by the
+        // view scale, so spacing looks identical in a 1:10 and a 1:25 view.
+        private const double TierFirstMm = 8.0;     // first vertical tier from the left face
+        private const double TierStepMm = 8.0;      // spacing between vertical tiers
+        private const double LabelGapMm = 2.0;      // gap between dimension end and label
+
+        // Top horizontal dimensions
+        private const bool PlaceTopDimsAboveRebar = true; // true = sit above the highest bar/embed in the assembly
+        private const double TopDimClearanceMm = 10.0;    // gap between highest bar and the partial dim (when above rebar)
+        private const double TopDimStepMm = 10.0;         // gap between partial and overall dim
+        private const double TopPartialMm = 14.0;         // partial dim height above the column top (only if PlaceTopDimsAboveRebar = false)
+
+        // Labels (set to null to skip a label)
+        private const string LblLength = "LENGTH";  // overall horizontal
+        private const string LblPartial = "L1";     // partial horizontal
+        private const string LblHeight = "HEIGHT";  // overall vertical
+        private const string LblTier = "L2";        // intermediate vertical tier
+
+        private const bool DrawLabelLine = true;    // short detail line carrying the dim line out under the label
+
+        // Corbel detection
+        private const bool DetectCorbelsByProtrusion = true; // also treat any embed sticking out past the column sides as a corbel
+        private const double ProtrusionTolFt = 0.05;
+
+        // Show a diagnostics dialog after each run (families found, what was accepted/rejected)
+        private const bool ShowDiagnostics = true;
+
+        // Model tolerances (feet)
+        private const double GeomTolFt = 0.02;               // treat Z values closer than this as the same plane
+        private const double RebarZoneMinSeparationFt = 1.0; // side view: min spacing between rebar-zone planes
+
+        // =====================================================================
+        //  Working state for one run
+        // =====================================================================
+        private Document _doc;
+        private View _view;
+        private double _scale;
+        private ElementId _textTypeId;
+        private double _textHeight;   // model feet
+        private double _colLeftX, _colRightX;
+        private XYZ _testOrigin;
+        private string _warnings = "";
+        private readonly StringBuilder _diag = new StringBuilder();
+
+        private double Off(double paperMm) => paperMm * _scale / 304.8;
+        private double TierMm(int tier) => TierFirstMm + (tier - 1) * TierStepMm;
+
         public Result Execute(ExternalCommandData commandData, ref string message, ElementSet elements)
         {
             UIDocument uidoc = commandData.Application.ActiveUIDocument;
@@ -31,15 +83,15 @@ namespace StructAutoDetailing
                 List<Element> elementsToProcess = new List<Element>();
                 FamilyInstance mainColumn = null;
 
-                // FIXED: Restored Assembly Isolation Logic to fix Argument 3 mismatch error
+                // Assembly isolation: only harvest members of the selected assembly
                 if (selectedElem is AssemblyInstance assembly)
                 {
                     foreach (ElementId memberId in assembly.GetMemberIds())
                     {
                         Element member = doc.GetElement(memberId);
                         elementsToProcess.Add(member);
-                        // FIXED: Replaced IntegerValue with Value for Revit 2024+
-                        if (member is FamilyInstance fi && fi.Category.Id.Value == (long)BuiltInCategory.OST_StructuralColumns)
+                        if (member is FamilyInstance fi && fi.Category != null &&
+                            fi.Category.Id.Value == (long)BuiltInCategory.OST_StructuralColumns)
                         {
                             mainColumn = fi;
                         }
@@ -57,9 +109,9 @@ namespace StructAutoDetailing
                     return Result.Failed;
                 }
 
-                Reference[] sideFaces = GetLeftAndRightColumnFaces(doc, activeView, mainColumn);
-                Reference bottomFace = GetLowestColumnFace(doc, activeView, mainColumn);
-                Reference topFace = GetHighestColumnFace(doc, activeView, mainColumn);
+                Reference[] sideFaces = GetLeftAndRightColumnFaces(activeView, mainColumn);
+                Reference bottomFace = GetLowestColumnFace(activeView, mainColumn);
+                Reference topFace = GetHighestColumnFace(activeView, mainColumn);
 
                 if (bottomFace == null || topFace == null || sideFaces[0] == null || sideFaces[1] == null)
                 {
@@ -69,153 +121,184 @@ namespace StructAutoDetailing
 
                 PlanarFace topPlanarFace = mainColumn.GetGeometryObjectFromReference(topFace) as PlanarFace;
                 PlanarFace leftPlanarFace = mainColumn.GetGeometryObjectFromReference(sideFaces[0]) as PlanarFace;
+                PlanarFace rightPlanarFace = mainColumn.GetGeometryObjectFromReference(sideFaces[1]) as PlanarFace;
+                PlanarFace bottomPlanarFace = mainColumn.GetGeometryObjectFromReference(bottomFace) as PlanarFace;
 
-                double colTopZ = topPlanarFace.Origin.DotProduct(activeView.UpDirection);
-                double colBottomZ = (mainColumn.GetGeometryObjectFromReference(bottomFace) as PlanarFace).Origin.DotProduct(activeView.UpDirection);
+                if (topPlanarFace == null || leftPlanarFace == null || rightPlanarFace == null || bottomPlanarFace == null)
+                {
+                    TaskDialog.Show("Error", "Could not resolve the column faces to planar geometry.");
+                    return Result.Failed;
+                }
 
+                XYZ viewUp = activeView.UpDirection;
+                XYZ viewRight = activeView.RightDirection;
+                double colTopZ = topPlanarFace.Origin.DotProduct(viewUp);
+                double colBottomZ = bottomPlanarFace.Origin.DotProduct(viewUp);
+                double colRightX = rightPlanarFace.Origin.DotProduct(viewRight);
+                double colLeftX = leftPlanarFace.Origin.DotProduct(viewRight);
+
+                // View orientation vs. the column's own axes (not world axes)
                 XYZ viewDir = activeView.ViewDirection;
-                XYZ colRight = mainColumn.HandOrientation; 
-                XYZ colForward = mainColumn.FacingOrientation; 
-                
-                double dotX = Math.Abs(activeView.RightDirection.DotProduct(colRight));
-                double dotY = Math.Abs(activeView.RightDirection.DotProduct(colForward));
-                
-                bool isSideView = Math.Abs(viewDir.X) > 0.5;
-                FamilyInstanceReferenceType topCenterRefType = dotX > dotY ? FamilyInstanceReferenceType.CenterLeftRight : FamilyInstanceReferenceType.CenterFrontBack;
+                XYZ colHand = mainColumn.HandOrientation;
+                XYZ colFacing = mainColumn.FacingOrientation;
 
-                string debugWarnings = "";
+                double dotX = Math.Abs(viewRight.DotProduct(colHand));
+                double dotY = Math.Abs(viewRight.DotProduct(colFacing));
+
+                // Looking along the column's facing axis = Front/Back elevation.
+                // Looking along the hand axis = Right/Left elevation.
+                bool isSideView = Math.Abs(viewDir.DotProduct(colHand)) > Math.Abs(viewDir.DotProduct(colFacing));
+                FamilyInstanceReferenceType topCenterRefType = dotX > dotY
+                    ? FamilyInstanceReferenceType.CenterLeftRight
+                    : FamilyInstanceReferenceType.CenterFrontBack;
+
+                // Init working state
+                _doc = doc;
+                _view = activeView;
+                _scale = Math.Max(1, activeView.Scale);
+                _warnings = "";
+                _diag.Clear();
+                _colLeftX = colLeftX;
+                _colRightX = colRightX;
+                _textTypeId = doc.GetDefaultElementTypeId(ElementTypeGroup.TextNoteType);
+                double textSizeFt = 2.5 / 304.8;
+                TextNoteType tnt = doc.GetElement(_textTypeId) as TextNoteType;
+                Parameter sizeParam = tnt?.get_Parameter(BuiltInParameter.TEXT_SIZE);
+                if (sizeParam != null && sizeParam.AsDouble() > 0) textSizeFt = sizeParam.AsDouble();
+                _textHeight = textSizeFt * _scale;
+
+                XYZ leftOrigin = leftPlanarFace.Origin;
+                XYZ topOrigin = topPlanarFace.Origin;
+                _testOrigin = leftOrigin + viewRight * -Off(TierMm(1));
+
+                // Where do the horizontal dims start? Above the highest bar so they never cross rebar.
+                double assemblyTopZ = ComputeAssemblyTopZ(elementsToProcess, viewUp, colTopZ);
+                double dimBaseZ = PlaceTopDimsAboveRebar ? Math.Max(colTopZ, assemblyTopZ) : colTopZ;
+                XYZ topDimBase = topOrigin + viewUp * (dimBaseZ - topOrigin.DotProduct(viewUp));
+                double partialOff = PlaceTopDimsAboveRebar ? TopDimClearanceMm : TopPartialMm;
+                double overallOff = partialOff + TopDimStepMm;
 
                 using (Transaction t = new Transaction(doc, "Smart Dimensioning"))
                 {
                     t.Start();
-                    
+
+                    // ---------- Top horizontal dimensions ----------
                     Reference centerRef = null;
                     IList<Reference> centerRefs = mainColumn.GetReferences(topCenterRefType);
                     if (centerRefs != null && centerRefs.Count > 0) centerRef = centerRefs[0];
 
-                    try 
+                    TryDim("Top Partial", () =>
                     {
-                        if (centerRef != null)
-                        {
-                            ReferenceArray topPartialRefs = new ReferenceArray();
-                            topPartialRefs.Append(sideFaces[0]); 
-                            topPartialRefs.Append(centerRef);    
-                            topPartialRefs.Append(sideFaces[1]); 
-                            XYZ partialDimOrigin = topPlanarFace.Origin + (activeView.UpDirection * 7.0);
-                            doc.Create.NewDimension(activeView, Line.CreateBound(partialDimOrigin, partialDimOrigin + activeView.RightDirection), topPartialRefs);
-                        }
-                    } catch (Exception ex) { debugWarnings += $"- Top Partial: {ex.Message}\n"; }
+                        if (centerRef == null) return;
+                        ReferenceArray refs = new ReferenceArray();
+                        refs.Append(sideFaces[0]);
+                        refs.Append(centerRef);
+                        refs.Append(sideFaces[1]);
+                        MakeHorizontalDim(refs, topDimBase, partialOff, colRightX, LblPartial);
+                    });
 
-                    try 
+                    TryDim("Top Overall", () =>
                     {
-                        ReferenceArray topOverallRefs = new ReferenceArray();
-                        topOverallRefs.Append(sideFaces[0]); 
-                        topOverallRefs.Append(sideFaces[1]); 
-                        XYZ overallDimOrigin = topPlanarFace.Origin + (activeView.UpDirection * 8.5);
-                        doc.Create.NewDimension(activeView, Line.CreateBound(overallDimOrigin, overallDimOrigin + activeView.RightDirection), topOverallRefs);
-                    } catch (Exception ex) { debugWarnings += $"- Top Overall: {ex.Message}\n"; }
+                        ReferenceArray refs = new ReferenceArray();
+                        refs.Append(sideFaces[0]);
+                        refs.Append(sideFaces[1]);
+                        MakeHorizontalDim(refs, topDimBase, overallOff, colRightX, LblLength);
+                    });
 
                     if (!isSideView)
                     {
+                        // ---------- Back / Front elevation ----------
                         List<Reference> topHookRef, lowerHookRefs, corbelRefs;
                         Reference extremeBottomDowel;
-                        HarvestBackViewEmbeds(doc, activeView, elementsToProcess, colBottomZ, colTopZ, out topHookRef, out lowerHookRefs, out corbelRefs, out extremeBottomDowel);
+                        HarvestBackViewEmbeds(elementsToProcess, mainColumn, colBottomZ, colTopZ, bottomFace, topFace,
+                            out topHookRef, out lowerHookRefs, out corbelRefs, out extremeBottomDowel);
 
-                        try 
+                        // Tier 1: bottom -> corbel bottoms/tops -> top hook -> top
+                        TryDim("Back Tier 1", () =>
                         {
-                            ReferenceArray r1 = new ReferenceArray();
-                            r1.Append(bottomFace);
-                            foreach (Reference r in corbelRefs) r1.Append(r);
-                            foreach (Reference r in topHookRef) r1.Append(r);
-                            r1.Append(topFace);
-                            if (r1.Size > 2)
-                            {
-                                XYZ origin1 = leftPlanarFace.Origin + (activeView.RightDirection * -1.5);
-                                doc.Create.NewDimension(activeView, Line.CreateBound(origin1, origin1 + activeView.UpDirection), r1);
-                            }
-                        } catch (Exception ex) { debugWarnings += $"- Back Tier 1: {ex.Message}\n"; }
+                            List<Reference> cands = new List<Reference>();
+                            cands.AddRange(corbelRefs);
+                            cands.AddRange(topHookRef);
+                            ReferenceArray r1 = BuildValidArray(new[] { bottomFace, topFace }, cands, _testOrigin, "Tier 1");
+                            if (r1.Size > 2) MakeVerticalDim(r1, leftOrigin, TierMm(1), colTopZ, null);
+                            else _diag.AppendLine("Tier 1 skipped: no corbel or hook reference was usable.");
+                        });
 
-                        try 
+                        // Tier 2: bottom -> lower hooks -> top
+                        TryDim("Back Tier 2", () =>
                         {
-                            if (lowerHookRefs.Count > 0)
-                            {
-                                ReferenceArray r2 = new ReferenceArray();
-                                r2.Append(bottomFace);
-                                foreach (Reference r in lowerHookRefs) r2.Append(r);
-                                r2.Append(topFace);
-                                
-                                XYZ origin2 = leftPlanarFace.Origin + (activeView.RightDirection * -2.5);
-                                doc.Create.NewDimension(activeView, Line.CreateBound(origin2, origin2 + activeView.UpDirection), r2);
-                            }
-                        } catch (Exception ex) { debugWarnings += $"- Back Tier 2: {ex.Message}\n"; }
+                            if (lowerHookRefs.Count == 0) return;
+                            XYZ o2 = leftOrigin + viewRight * -Off(TierMm(2));
+                            ReferenceArray r2 = BuildValidArray(new[] { bottomFace, topFace }, lowerHookRefs, o2, "Tier 2");
+                            if (r2.Size > 2) MakeVerticalDim(r2, leftOrigin, TierMm(2), colTopZ, LblTier);
+                        });
 
-                        try 
+                        // Tier 3: (dowel ->) bottom -> top  = overall concrete depth (+ the dowel projection)
+                        TryDim("Back Tier 3", () =>
                         {
                             ReferenceArray r3 = new ReferenceArray();
+                            if (extremeBottomDowel != null) r3.Append(extremeBottomDowel);
                             r3.Append(bottomFace);
                             r3.Append(topFace);
-                            XYZ origin3 = leftPlanarFace.Origin + (activeView.RightDirection * -3.5);
-                            doc.Create.NewDimension(activeView, Line.CreateBound(origin3, origin3 + activeView.UpDirection), r3);
-                        } catch (Exception ex) { debugWarnings += $"- Back Tier 3: {ex.Message}\n"; }
+                            MakeVerticalDim(r3, leftOrigin, TierMm(3), colTopZ, LblHeight);
+                        });
 
-                        try 
+                        // Tier 4: extreme dowel -> top
+                        TryDim("Back Tier 4", () =>
                         {
-                            if (extremeBottomDowel != null)
+                            if (extremeBottomDowel == null)
                             {
-                                ReferenceArray r4 = new ReferenceArray();
-                                r4.Append(extremeBottomDowel); 
-                                r4.Append(topFace);            
-                                XYZ origin4 = leftPlanarFace.Origin + (activeView.RightDirection * -4.5);
-                                doc.Create.NewDimension(activeView, Line.CreateBound(origin4, origin4 + activeView.UpDirection), r4);
+                                _diag.AppendLine("Tier 4 skipped: no dowel / receptor found below the column bottom.");
+                                return;
                             }
-                        } catch (Exception ex) { debugWarnings += $"- Back Tier 4: {ex.Message}\n"; }
+                            ReferenceArray r4 = new ReferenceArray();
+                            r4.Append(extremeBottomDowel);
+                            r4.Append(topFace);
+                            MakeVerticalDim(r4, leftOrigin, TierMm(4), colTopZ, null);
+                        });
                     }
                     else
                     {
+                        // ---------- Right / Left elevation ----------
                         List<Reference> rebarZoneRefs;
                         Reference extremeBottomDowel;
-                        HarvestRightViewZones(doc, activeView, elementsToProcess, colBottomZ, colTopZ, out rebarZoneRefs, out extremeBottomDowel);
+                        HarvestRightViewZones(elementsToProcess, colBottomZ, colTopZ, out rebarZoneRefs, out extremeBottomDowel);
 
-                        try 
+                        TryDim("Right Tier 1 (Rebar)", () =>
                         {
-                            if (extremeBottomDowel != null && rebarZoneRefs.Count > 0)
-                            {
-                                ReferenceArray r1 = new ReferenceArray();
-                                r1.Append(extremeBottomDowel);
-                                foreach (Reference r in rebarZoneRefs) r1.Append(r);
-                                r1.Append(topFace);
-                                
-                                XYZ origin1 = leftPlanarFace.Origin + (activeView.RightDirection * -1.5);
-                                doc.Create.NewDimension(activeView, Line.CreateBound(origin1, origin1 + activeView.UpDirection), r1);
-                            }
-                        } catch (Exception ex) { debugWarnings += $"- Right Tier 1 (Rebar): {ex.Message}\n"; }
+                            if (extremeBottomDowel == null || rebarZoneRefs.Count == 0) return;
+                            ReferenceArray r1 = new ReferenceArray();
+                            r1.Append(extremeBottomDowel);
+                            foreach (Reference r in rebarZoneRefs) r1.Append(r);
+                            r1.Append(topFace);
+                            MakeVerticalDim(r1, leftOrigin, TierMm(1), colTopZ, LblTier);
+                        });
 
-                        try 
+                        TryDim("Right Tier 2", () =>
                         {
                             ReferenceArray r2 = new ReferenceArray();
                             r2.Append(bottomFace);
                             r2.Append(topFace);
-                            XYZ origin2 = leftPlanarFace.Origin + (activeView.RightDirection * -2.5);
-                            doc.Create.NewDimension(activeView, Line.CreateBound(origin2, origin2 + activeView.UpDirection), r2);
-                        } catch (Exception ex) { debugWarnings += $"- Right Tier 2: {ex.Message}\n"; }
+                            MakeVerticalDim(r2, leftOrigin, TierMm(2), colTopZ, LblHeight);
+                        });
 
-                        try 
+                        TryDim("Right Tier 3", () =>
                         {
-                            if (extremeBottomDowel != null)
-                            {
-                                ReferenceArray r3 = new ReferenceArray();
-                                r3.Append(extremeBottomDowel); 
-                                r3.Append(topFace);            
-                                XYZ origin3 = leftPlanarFace.Origin + (activeView.RightDirection * -3.5);
-                                doc.Create.NewDimension(activeView, Line.CreateBound(origin3, origin3 + activeView.UpDirection), r3);
-                            }
-                        } catch (Exception ex) { debugWarnings += $"- Right Tier 3: {ex.Message}\n"; }
+                            if (extremeBottomDowel == null) return;
+                            ReferenceArray r3 = new ReferenceArray();
+                            r3.Append(extremeBottomDowel);
+                            r3.Append(topFace);
+                            MakeVerticalDim(r3, leftOrigin, TierMm(3), colTopZ, null);
+                        });
                     }
 
                     t.Commit();
                 }
 
-                if (!string.IsNullOrEmpty(debugWarnings)) TaskDialog.Show("Warnings", "Some dimension lines could not be drawn:\n\n" + debugWarnings);
+                string report = "";
+                if (!string.IsNullOrEmpty(_warnings)) report += "Failures:\n" + _warnings + "\n";
+                if (ShowDiagnostics && _diag.Length > 0) report += "Diagnostics:\n" + _diag;
+                if (!string.IsNullOrEmpty(report)) TaskDialog.Show("Smart Dimensioning", report);
                 return Result.Succeeded;
             }
             catch (Autodesk.Revit.Exceptions.OperationCanceledException) { return Result.Cancelled; }
@@ -226,8 +309,343 @@ namespace StructAutoDetailing
             }
         }
 
-        private void HarvestBackViewEmbeds(Document doc, View activeView, List<Element> elementsToProcess, double colBottomZ, double colTopZ, 
-            out List<Reference> topHookRef, out List<Reference> lowerHookRefs, out List<Reference> corbelRefs, out Reference extremeBottomDowel)
+        // =====================================================================
+        //  Dimension + label creation
+        // =====================================================================
+
+        private void TryDim(string name, Action action)
+        {
+            try { action(); }
+            catch (Exception ex) { _warnings += $"- {name}: {ex.Message}\n"; }
+        }
+
+        /// <summary>
+        /// Trial-creates a vertical dimension in a SubTransaction and rolls it back.
+        /// Tells us whether Revit will actually accept this set of references.
+        /// </summary>
+        private bool TestDimension(ReferenceArray refs, XYZ origin)
+        {
+            using (SubTransaction st = new SubTransaction(_doc))
+            {
+                st.Start();
+                try
+                {
+                    Dimension d = _doc.Create.NewDimension(_view, Line.CreateBound(origin, origin + _view.UpDirection), refs);
+                    return d != null;
+                }
+                catch { return false; }
+                finally { st.RollBack(); }
+            }
+        }
+
+        private bool IsUsable(Reference candidate, Reference bottomFace, Reference topFace)
+        {
+            ReferenceArray arr = new ReferenceArray();
+            arr.Append(bottomFace);
+            arr.Append(topFace);
+            arr.Append(candidate);
+            return TestDimension(arr, _testOrigin);
+        }
+
+        /// <summary>Adds candidates one at a time, keeping only those Revit accepts, so one bad ref can't kill a whole tier.</summary>
+        private ReferenceArray BuildValidArray(IEnumerable<Reference> required, IEnumerable<Reference> candidates,
+            XYZ origin, string tag)
+        {
+            ReferenceArray arr = new ReferenceArray();
+            foreach (Reference r in required) arr.Append(r);
+
+            int rejected = 0;
+            foreach (Reference c in candidates)
+            {
+                ReferenceArray trial = new ReferenceArray();
+                foreach (Reference r in arr) trial.Append(r);
+                trial.Append(c);
+
+                if (TestDimension(trial, origin)) arr = trial;
+                else rejected++;
+            }
+            if (rejected > 0) _diag.AppendLine($"{tag}: {rejected} reference(s) rejected by Revit.");
+            return arr;
+        }
+
+        /// <summary>Vertical dimension string left of the column. Label goes above the top face.</summary>
+        private Dimension MakeVerticalDim(ReferenceArray refs, XYZ leftOrigin, double offsetMm, double colTopZ, string label)
+        {
+            XYZ o = leftOrigin + _view.RightDirection * -Off(offsetMm);
+            Dimension dim = _doc.Create.NewDimension(_view, Line.CreateBound(o, o + _view.UpDirection), refs);
+            if (dim != null && !string.IsNullOrEmpty(label)) AddVerticalLabel(o, colTopZ, label);
+            return dim;
+        }
+
+        /// <summary>Horizontal dimension string above the column. Label goes right of the right face.</summary>
+        private Dimension MakeHorizontalDim(ReferenceArray refs, XYZ baseOrigin, double offsetMm, double colRightX, string label)
+        {
+            XYZ o = baseOrigin + _view.UpDirection * Off(offsetMm);
+            Dimension dim = _doc.Create.NewDimension(_view, Line.CreateBound(o, o + _view.RightDirection), refs);
+            if (dim != null && !string.IsNullOrEmpty(label)) AddHorizontalLabel(o, colRightX, label);
+            return dim;
+        }
+
+        private void AddHorizontalLabel(XYZ dimLineOrigin, double colRightX, string text)
+        {
+            try
+            {
+                XYZ r = _view.RightDirection, u = _view.UpDirection;
+                double h = _textHeight;
+                double width = text.Length * h * 0.8;
+
+                XYZ lineStart = dimLineOrigin + r * (colRightX - dimLineOrigin.DotProduct(r));
+                XYZ textStart = lineStart + r * Off(LabelGapMm);
+
+                // TextNote insertion point is the top-left corner -> lift by one text height
+                CreateNote(textStart + u * (h * 1.25), text, 0.0);
+
+                if (DrawLabelLine)
+                    DrawLine(lineStart, textStart + r * width);
+            }
+            catch (Exception ex) { _warnings += $"- Label '{text}': {ex.Message}\n"; }
+        }
+
+        private void AddVerticalLabel(XYZ tierOrigin, double colTopZ, string text)
+        {
+            try
+            {
+                XYZ r = _view.RightDirection, u = _view.UpDirection;
+                double h = _textHeight;
+                double width = text.Length * h * 0.8;
+
+                XYZ lineStart = tierOrigin + u * (colTopZ - tierOrigin.DotProduct(u));
+                XYZ textStart = lineStart + u * Off(LabelGapMm);
+
+                // Text rotated 90deg CCW reads bottom-to-top and its body extends to the RIGHT of the
+                // insertion point, so shift left by one text height to sit beside the tier line.
+                CreateNote(textStart - r * (h * 1.25), text, Math.PI / 2.0);
+
+                if (DrawLabelLine)
+                    DrawLine(lineStart, textStart + u * width);
+            }
+            catch (Exception ex) { _warnings += $"- Label '{text}': {ex.Message}\n"; }
+        }
+
+        private void CreateNote(XYZ position, string text, double rotationRadians)
+        {
+            TextNoteOptions opts = new TextNoteOptions(_textTypeId)
+            {
+                HorizontalAlignment = HorizontalTextAlignment.Left,
+                VerticalAlignment = VerticalTextAlignment.Top,
+                Rotation = rotationRadians
+            };
+            TextNote.Create(_doc, _view.Id, position, text, opts);
+        }
+
+        private void DrawLine(XYZ a, XYZ b)
+        {
+            if (a.DistanceTo(b) < 0.01) return;
+            _doc.Create.NewDetailCurve(_view, Line.CreateBound(a, b));
+        }
+
+        // =====================================================================
+        //  Geometry helpers
+        // =====================================================================
+
+        /// <summary>Geometry objects with nested GeometryInstances expanded (up to 3 levels deep).</summary>
+        private static IEnumerable<GeometryObject> FlattenGeometry(GeometryElement ge, int depth = 0)
+        {
+            if (ge == null) yield break;
+            foreach (GeometryObject go in ge)
+            {
+                if (go is GeometryInstance gi)
+                {
+                    if (depth >= 3) continue;
+                    foreach (GeometryObject inner in FlattenGeometry(gi.GetInstanceGeometry(), depth + 1))
+                        yield return inner;
+                }
+                else
+                {
+                    yield return go;
+                }
+            }
+        }
+
+        private static IEnumerable<Solid> GetSolids(GeometryElement ge)
+        {
+            foreach (GeometryObject o in FlattenGeometry(ge))
+                if (o is Solid s && s.Faces.Size > 0) yield return s;
+        }
+
+        private static IEnumerable<PlanarFace> GetHorizontalFaces(GeometryElement ge, XYZ viewUp, double minDot = 0.99)
+        {
+            foreach (Solid s in GetSolids(ge))
+                foreach (Face f in s.Faces)
+                    if (f is PlanarFace pf && pf.Reference != null &&
+                        Math.Abs(pf.FaceNormal.DotProduct(viewUp)) > minDot)
+                        yield return pf;
+        }
+
+        /// <summary>Min/max of an element's bounding box projected on an axis (all 8 corners, so rotated views are fine).</summary>
+        private bool TryGetExtents(Element e, XYZ axis, out double min, out double max)
+        {
+            min = double.MaxValue; max = double.MinValue;
+            BoundingBoxXYZ bb = e.get_BoundingBox(_view) ?? e.get_BoundingBox(null);
+            if (bb == null) return false;
+            Transform tf = bb.Transform ?? Transform.Identity;
+
+            double[] xs = { bb.Min.X, bb.Max.X };
+            double[] ys = { bb.Min.Y, bb.Max.Y };
+            double[] zs = { bb.Min.Z, bb.Max.Z };
+            foreach (double x in xs)
+                foreach (double y in ys)
+                    foreach (double z in zs)
+                    {
+                        double d = tf.OfPoint(new XYZ(x, y, z)).DotProduct(axis);
+                        if (d < min) min = d;
+                        if (d > max) max = d;
+                    }
+            return true;
+        }
+
+        /// <summary>Highest point of anything in the assembly (bars, hooks, dowels), along the view's up axis.</summary>
+        private double ComputeAssemblyTopZ(List<Element> elems, XYZ viewUp, double colTopZ)
+        {
+            double top = colTopZ;
+            foreach (Element e in elems)
+            {
+                double mn, mx;
+                if (TryGetExtents(e, viewUp, out mn, out mx) && mx > top) top = mx;
+            }
+            return top;
+        }
+
+        private static void TrackLowestDowel(GeometryElement ge, XYZ viewUp, double colBottomZ,
+            ref double lowestZ, ref Reference lowestRef)
+        {
+            foreach (PlanarFace pf in GetHorizontalFaces(ge, viewUp))
+            {
+                double z = pf.Origin.DotProduct(viewUp);
+                if (z < lowestZ && z < (colBottomZ - GeomTolFt))
+                {
+                    lowestZ = z;
+                    lowestRef = pf.Reference;
+                }
+            }
+        }
+
+        /// <summary>Highest and lowest horizontal face of a corbel, each paired with its exact Z.</summary>
+        private static void CollectCorbelFaceRefs(FamilyInstance inst, XYZ viewUp, Options opts,
+            List<Tuple<Reference, double>> sink)
+        {
+            GeometryElement ge = inst.get_Geometry(opts);
+            if (ge == null) return;
+
+            Reference top = null, bottom = null;
+            double maxZ = double.MinValue, minZ = double.MaxValue;
+
+            foreach (PlanarFace pf in GetHorizontalFaces(ge, viewUp))
+            {
+                double z = pf.Origin.DotProduct(viewUp);
+                if (z > maxZ) { maxZ = z; top = pf.Reference; }
+                if (z < minZ) { minZ = z; bottom = pf.Reference; }
+            }
+
+            if (top != null) sink.Add(Tuple.Create(top, maxZ));
+            if (bottom != null && Math.Abs(maxZ - minZ) > GeomTolFt) sink.Add(Tuple.Create(bottom, minZ));
+        }
+
+        /// <summary>Family reference planes (DimRef / Top / Bottom) with Z estimated from the bounding box.</summary>
+        private static void CollectCorbelPlaneRefs(FamilyInstance inst, double zMin, double zMax,
+            List<Tuple<Reference, double>> sink)
+        {
+            try
+            {
+                Reference named = inst.GetReferenceByName("DimRef");
+                if (named != null) sink.Add(Tuple.Create(named, zMax));
+            }
+            catch { }
+
+            try
+            {
+                IList<Reference> tops = inst.GetReferences(FamilyInstanceReferenceType.Top);
+                if (tops != null && tops.Count > 0) sink.Add(Tuple.Create(tops[0], zMax));
+            }
+            catch { }
+
+            try
+            {
+                IList<Reference> bottoms = inst.GetReferences(FamilyInstanceReferenceType.Bottom);
+                if (bottoms != null && bottoms.Count > 0) sink.Add(Tuple.Create(bottoms[0], zMin));
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Downward-facing horizontal faces of the column body between its top and bottom that reach the
+        /// column's side extremes (the underside of a head block, for example). Each is tested against Revit.
+        /// </summary>
+        private void CollectColumnStepFaces(FamilyInstance column, double colTopZ, double colBottomZ,
+            Reference bottomFace, Reference topFace, List<Tuple<Reference, double>> sink)
+        {
+            Options opts = new Options { ComputeReferences = true, View = _view };
+            GeometryElement ge = column.get_Geometry(opts);
+            if (ge == null) return;
+
+            XYZ up = _view.UpDirection, right = _view.RightDirection;
+
+            foreach (Solid s in GetSolids(ge))
+            {
+                foreach (Face f in s.Faces)
+                {
+                    if (!(f is PlanarFace pf) || pf.Reference == null) continue;
+                    if (pf.FaceNormal.DotProduct(up) > -0.99) continue;   // underside faces only
+
+                    double z = pf.Origin.DotProduct(up);
+                    if (z <= colBottomZ + GeomTolFt || z >= colTopZ - GeomTolFt) continue;
+
+                    // must reach the left or right extreme of the column silhouette
+                    double mn = double.MaxValue, mx = double.MinValue;
+                    foreach (CurveLoop loop in pf.GetEdgesAsCurveLoops())
+                        foreach (Curve c in loop)
+                            foreach (XYZ p in c.Tessellate())
+                            {
+                                double d = p.DotProduct(right);
+                                if (d < mn) mn = d;
+                                if (d > mx) mx = d;
+                            }
+                    if (mn > _colLeftX + ProtrusionTolFt && mx < _colRightX - ProtrusionTolFt) continue;
+
+                    if (IsUsable(pf.Reference, bottomFace, topFace))
+                        sink.Add(Tuple.Create(pf.Reference, z));
+                }
+            }
+        }
+
+        private static Reference FindHookGeometryRef(GeometryElement ge, XYZ viewUp)
+        {
+            foreach (GeometryObject o in FlattenGeometry(ge))
+            {
+                if (o is Solid solid)
+                {
+                    foreach (Face face in solid.Faces)
+                        if (face is PlanarFace pf && pf.Reference != null &&
+                            Math.Abs(pf.FaceNormal.DotProduct(viewUp)) > 0.99)
+                            return pf.Reference;
+                }
+                else if (o is Line line && line.Reference != null &&
+                         Math.Abs(line.Direction.DotProduct(viewUp)) < 0.05)
+                {
+                    return line.Reference;
+                }
+            }
+            return null;
+        }
+
+        // =====================================================================
+        //  Back / Front elevation harvesting
+        // =====================================================================
+
+        private void HarvestBackViewEmbeds(List<Element> elementsToProcess, FamilyInstance mainColumn, double colBottomZ, double colTopZ,
+            Reference bottomFace, Reference topFace,
+            out List<Reference> topHookRef, out List<Reference> lowerHookRefs, out List<Reference> corbelRefs,
+            out Reference extremeBottomDowel)
         {
             topHookRef = new List<Reference>();
             lowerHookRefs = new List<Reference>();
@@ -237,82 +655,85 @@ namespace StructAutoDetailing
 
             List<Tuple<Reference, double>> tempHooks = new List<Tuple<Reference, double>>();
             List<Tuple<Reference, double>> tempCorbels = new List<Tuple<Reference, double>>();
-            
-            XYZ viewUp = activeView.UpDirection;
-            Options geomOptions = new Options { ComputeReferences = true, View = activeView, IncludeNonVisibleObjects = true };
+
+            XYZ viewUp = _view.UpDirection;
+            XYZ viewRight = _view.RightDirection;
+            Options geomOptions = new Options { ComputeReferences = true, View = _view, IncludeNonVisibleObjects = true };
+
+            // family name -> role, for the diagnostics report
+            Dictionary<string, string> roles = new Dictionary<string, string>();
+            int rebarCount = 0, corbelCount = 0, hookCount = 0, dowelCount = 0;
+            double dowelLowestMm = double.MaxValue;
+            int dowelHorizFaces = 0, dowelHorizRefs = 0;
 
             foreach (Element elem in elementsToProcess)
             {
-                if (elem is FamilyInstance inst && inst.Category.Id.Value != (long)BuiltInCategory.OST_StructuralColumns)
+                if (elem is FamilyInstance inst)
                 {
+                    if (inst.Category != null && inst.Category.Id.Value == (long)BuiltInCategory.OST_StructuralColumns)
+                        continue;
+
                     string famName = inst.Symbol.FamilyName.ToLower();
 
                     bool isDowel = famName.Contains("groutec") || famName.Contains("receptor") || famName.Contains("donor") || famName.Contains("tube");
-                    bool isCorbel = (famName.Contains("corbel") || famName.Contains("conn") || famName.Contains("pic")) && !isDowel;
                     bool isHook = famName.Contains("hock") || famName.Contains("lifting") || famName.Contains("lifter");
+                    bool nameCorbel = (famName.Contains("corbel") || famName.Contains("conn") || famName.Contains("pic")) && !isDowel;
+
+                    // Geometry-based corbel detection: anything that sticks out past the column sides
+                    bool protrudes = false;
+                    if (DetectCorbelsByProtrusion && !isDowel && !isHook)
+                    {
+                        double rMin, rMax;
+                        if (TryGetExtents(inst, viewRight, out rMin, out rMax))
+                            protrudes = rMin < _colLeftX - ProtrusionTolFt || rMax > _colRightX + ProtrusionTolFt;
+                    }
+                    bool isCorbel = (nameCorbel || protrudes) && !isDowel && !isHook;
+
+                    string role = isCorbel ? (nameCorbel ? "corbel (by name)" : "corbel (by protrusion)")
+                                : isHook ? "hook" : isDowel ? "dowel" : "ignored";
+                    roles[inst.Symbol.FamilyName] = role;
 
                     GeometryElement geomElem = inst.get_Geometry(geomOptions);
 
                     if (isCorbel)
                     {
-                        Reference validRef = null;
-                        double maxZ = -9999;
-                        
-                        // 1. Try named reference "DimRef" first 
-                        try { validRef = inst.GetReferenceByName("DimRef"); } catch { }
+                        corbelCount++;
 
-                        // 2. Try standard built-in Top reference plane
-                        if (validRef == null)
+                        // 1) exact top/bottom faces from the geometry, each tested against Revit
+                        List<Tuple<Reference, double>> faceCands = new List<Tuple<Reference, double>>();
+                        CollectCorbelFaceRefs(inst, viewUp, geomOptions, faceCands);
+                        List<Tuple<Reference, double>> usable = faceCands.Where(c => IsUsable(c.Item1, bottomFace, topFace)).ToList();
+                        string source = "geometry faces";
+
+                        // 2) fall back to the family's reference planes
+                        int planeCandCount = 0;
+                        if (usable.Count == 0)
                         {
-                            IList<Reference> topRefs = inst.GetReferences(FamilyInstanceReferenceType.Top);
-                            if (topRefs != null && topRefs.Count > 0) validRef = topRefs[0];
+                            List<Tuple<Reference, double>> planeCands = new List<Tuple<Reference, double>>();
+                            double zMin, zMax;
+                            if (TryGetExtents(inst, viewUp, out zMin, out zMax))
+                                CollectCorbelPlaneRefs(inst, zMin, zMax, planeCands);
+                            planeCandCount = planeCands.Count;
+                            usable = planeCands.Where(c => IsUsable(c.Item1, bottomFace, topFace)).ToList();
+                            source = "reference planes";
                         }
 
-                        // 3. Fallback: Find ONLY the single highest horizontal geometric face (Top of corbel)
-                        if (validRef == null && geomElem != null)
-                        {
-                            foreach (GeometryObject geomObj in geomElem)
-                            {
-                                IEnumerable<GeometryObject> objectsToCheck = new List<GeometryObject> { geomObj };
-                                if (geomObj is GeometryInstance geomInst) objectsToCheck = geomInst.GetInstanceGeometry();
-                                foreach (GeometryObject obj in objectsToCheck)
-                                {
-                                    if (obj is Solid solid)
-                                    {
-                                        foreach (Face face in solid.Faces)
-                                        {
-                                            if (face is PlanarFace planarFace && Math.Abs(planarFace.FaceNormal.DotProduct(viewUp)) > 0.99)
-                                            {
-                                                double z = planarFace.Origin.DotProduct(viewUp);
-                                                // Grab the highest face that is within the column bounds
-                                                if (z > maxZ && Math.Abs(z - colTopZ) > 0.05 && Math.Abs(z - colBottomZ) > 0.05)
-                                                {
-                                                    maxZ = z;
-                                                    validRef = planarFace.Reference;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if (validRef != null)
-                        {
-                            // Calculate Z-height for deduplication sorting
-                            BoundingBoxXYZ bbox = inst.get_BoundingBox(activeView) ?? inst.get_BoundingBox(null);
-                            double refZ = maxZ != -9999 ? maxZ : (bbox != null ? bbox.Max.DotProduct(viewUp) : 0);
-                            tempCorbels.Add(new Tuple<Reference, double>(validRef, refZ));
-                        }
+                        tempCorbels.AddRange(usable);
+                        _diag.AppendLine($"Corbel '{inst.Symbol.FamilyName}' ({role}): " +
+                                         $"{faceCands.Count} face ref(s) found, " +
+                                         (planeCandCount > 0 || source == "reference planes" ? $"{planeCandCount} plane ref(s) found, " : "") +
+                                         $"{usable.Count} usable via {source}.");
                     }
+
                     if (isHook)
                     {
+                        hookCount++;
                         Reference validRef = null;
-                        
-                        // 1. BULLETPROOF METHOD: Fetch specifically by the Name we just set
+
+                        // 1. Named reference plane "DimRef"
                         try { validRef = inst.GetReferenceByName("DimRef"); } catch { }
 
-                        // 2. Try built-in Reference Planes (Fallback)
+                        // 2. Built-in reference planes
                         if (validRef == null)
                         {
                             FamilyInstanceReferenceType[] refTypes = {
@@ -322,49 +743,18 @@ namespace StructAutoDetailing
                                 FamilyInstanceReferenceType.Top,
                                 FamilyInstanceReferenceType.Bottom
                             };
-                            
                             foreach (var rt in refTypes)
                             {
                                 IList<Reference> refs = inst.GetReferences(rt);
-                                if (refs != null && refs.Count > 0)
-                                {
-                                    validRef = refs[0];
-                                    break;
-                                }
+                                if (refs != null && refs.Count > 0) { validRef = refs[0]; break; }
                             }
                         }
 
-                        // 3. Deep Geometry Fallback (If no planes exist, grab highest point)
+                        // 3. Geometry fallback (horizontal face or the invisible model line)
                         if (validRef == null && geomElem != null)
-                        {
-                            foreach (GeometryObject geomObj in geomElem)
-                            {
-                                IEnumerable<GeometryObject> objectsToCheck = new List<GeometryObject> { geomObj };
-                                if (geomObj is GeometryInstance geomInst) objectsToCheck = geomInst.GetInstanceGeometry();
-                                foreach (GeometryObject obj in objectsToCheck)
-                                {
-                                    if (obj is Solid solid)
-                                    {
-                                        foreach (Face face in solid.Faces)
-                                        {
-                                            if (face is PlanarFace planarFace && Math.Abs(planarFace.FaceNormal.DotProduct(viewUp)) > 0.99)
-                                            {
-                                                validRef = planarFace.Reference;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    else if (obj is Line line && Math.Abs(line.Direction.DotProduct(viewUp)) < 0.05)
-                                    {
-                                        validRef = line.Reference;
-                                        break;
-                                    }
-                                }
-                                if (validRef != null) break;
-                            }
-                        }
+                            validRef = FindHookGeometryRef(geomElem, viewUp);
 
-                        BoundingBoxXYZ bbox = inst.get_BoundingBox(activeView) ?? inst.get_BoundingBox(null);
+                        BoundingBoxXYZ bbox = inst.get_BoundingBox(_view) ?? inst.get_BoundingBox(null);
                         if (bbox != null && validRef != null)
                         {
                             double refZ = ((bbox.Max + bbox.Min) / 2.0).DotProduct(viewUp);
@@ -373,86 +763,101 @@ namespace StructAutoDetailing
                     }
                     else if (isDowel && geomElem != null)
                     {
-                        // Handle Dowels modeled as Family Instances
-                        foreach (GeometryObject geomObj in geomElem)
-                        {
-                            IEnumerable<GeometryObject> objectsToCheck = new List<GeometryObject> { geomObj };
-                            if (geomObj is GeometryInstance geomInst) objectsToCheck = geomInst.GetInstanceGeometry();
-                            foreach (GeometryObject obj in objectsToCheck)
-                            {
-                                if (obj is Solid solid)
+                        dowelCount++;
+                        TrackLowestDowel(geomElem, viewUp, colBottomZ, ref absoluteLowestDowelZ, ref extremeBottomDowel);
+
+                        // probe: where is this dowel relative to the column bottom, and does it expose usable faces?
+                        double dmn, dmx;
+                        if (TryGetExtents(inst, viewUp, out dmn, out dmx))
+                            dowelLowestMm = Math.Min(dowelLowestMm, (dmn - colBottomZ) * 304.8);
+                        foreach (Solid ds in GetSolids(geomElem))
+                            foreach (Face df in ds.Faces)
+                                if (df is PlanarFace dpf && Math.Abs(dpf.FaceNormal.DotProduct(viewUp)) > 0.99)
                                 {
-                                    foreach (Face face in solid.Faces)
-                                    {
-                                        if (face is PlanarFace planarFace && Math.Abs(planarFace.FaceNormal.DotProduct(viewUp)) > 0.99)
-                                        {
-                                            double z = planarFace.Origin.DotProduct(viewUp);
-                                            if (z < absoluteLowestDowelZ && z < (colBottomZ - 0.05))
-                                            {
-                                                absoluteLowestDowelZ = z;
-                                                extremeBottomDowel = planarFace.Reference;
-                                            }
-                                        }
-                                    }
+                                    dowelHorizFaces++;
+                                    if (dpf.Reference != null) dowelHorizRefs++;
                                 }
-                            }
-                        }
                     }
                 }
                 else if (elem is Autodesk.Revit.DB.Structure.Rebar rebar)
                 {
-                    // Handle Dowels modeled as Structural Rebar
+                    rebarCount++;
+                    // Dowels modeled as structural rebar
                     GeometryElement geomElem = rebar.get_Geometry(geomOptions);
                     if (geomElem != null)
+                        TrackLowestDowel(geomElem, viewUp, colBottomZ, ref absoluteLowestDowelZ, ref extremeBottomDowel);
+                }
+            }
+
+            // ---- Fallback 1: dowel tips by name found nothing -> use ANY member that sticks out below the column bottom
+            if (extremeBottomDowel == null)
+            {
+                int shown = 0, belowCount = 0;
+                foreach (Element e in elementsToProcess)
+                {
+                    if (e is FamilyInstance fc && fc.Category != null &&
+                        fc.Category.Id.Value == (long)BuiltInCategory.OST_StructuralColumns) continue;
+
+                    double mn, mx;
+                    if (!TryGetExtents(e, viewUp, out mn, out mx)) continue;
+                    if (mn >= colBottomZ - GeomTolFt) continue;
+
+                    belowCount++;
+                    if (shown < 5)
                     {
-                        foreach (GeometryObject geomObj in geomElem)
+                        string nm = e is FamilyInstance fi2 ? fi2.Symbol.FamilyName : e.GetType().Name;
+                        _diag.AppendLine($"Member below column bottom: {nm} ({(colBottomZ - mn) * 304.8:0.#} mm below).");
+                        shown++;
+                    }
+
+                    GeometryElement g = e.get_Geometry(geomOptions);
+                    if (g != null)
+                        TrackLowestDowel(g, viewUp, colBottomZ, ref absoluteLowestDowelZ, ref extremeBottomDowel);
+
+                    // family reference-plane fallback (Bottom plane), tested against Revit
+                    if (extremeBottomDowel == null && e is FamilyInstance fi3)
+                    {
+                        try
                         {
-                            IEnumerable<GeometryObject> objectsToCheck = new List<GeometryObject> { geomObj };
-                            if (geomObj is GeometryInstance geomInst) objectsToCheck = geomInst.GetInstanceGeometry();
-                            foreach (GeometryObject obj in objectsToCheck)
+                            IList<Reference> bots = fi3.GetReferences(FamilyInstanceReferenceType.Bottom);
+                            if (bots != null && bots.Count > 0 && mn < absoluteLowestDowelZ &&
+                                IsUsable(bots[0], bottomFace, topFace))
                             {
-                                if (obj is Solid solid)
-                                {
-                                    foreach (Face face in solid.Faces)
-                                    {
-                                        if (face is PlanarFace planarFace && Math.Abs(planarFace.FaceNormal.DotProduct(viewUp)) > 0.99)
-                                        {
-                                            double z = planarFace.Origin.DotProduct(viewUp);
-                                            if (z < absoluteLowestDowelZ && z < (colBottomZ - 0.05))
-                                            {
-                                                absoluteLowestDowelZ = z;
-                                                extremeBottomDowel = planarFace.Reference;
-                                            }
-                                        }
-                                    }
-                                }
+                                absoluteLowestDowelZ = mn;
+                                extremeBottomDowel = bots[0];
                             }
                         }
+                        catch { }
                     }
                 }
+                _diag.AppendLine($"Fallback dowel search: {belowCount} member(s) extend below the column bottom -> " +
+                                 (extremeBottomDowel != null ? "reference found." : "no usable reference."));
             }
 
-            // Deduplicate Corbels to prevent Revit zero-length errors
-            if (tempCorbels.Count > 0)
+            // ---- Underside steps of the column itself (e.g. the head block's underside)
+            int stepCount0 = tempCorbels.Count;
+            try { CollectColumnStepFaces(mainColumn, colTopZ, colBottomZ, bottomFace, topFace, tempCorbels); }
+            catch (Exception ex) { _diag.AppendLine($"Column step faces failed: {ex.Message}"); }
+            _diag.AppendLine($"Column underside steps added to Tier 1: {tempCorbels.Count - stepCount0}.");
+
+            // De-duplicate corbel planes. Skip anything sitting on the column's top/bottom face
+            // (those are already in the dimension) and anything at the same Z as one already kept.
+            List<double> keptZ = new List<double>();
+            foreach (var c in tempCorbels.OrderByDescending(c => c.Item2))
             {
-                var sortedCorbels = tempCorbels.OrderByDescending(c => c.Item2).ToList();
-                double lastCorbelZ = -9999;
-                foreach (var c in sortedCorbels)
-                {
-                    if (Math.Abs(c.Item2 - lastCorbelZ) > 0.05)
-                    {
-                        corbelRefs.Add(c.Item1);
-                        lastCorbelZ = c.Item2;
-                    }
-                }
+                double z = c.Item2;
+                if (Math.Abs(z - colTopZ) < GeomTolFt || Math.Abs(z - colBottomZ) < GeomTolFt) continue;
+                if (keptZ.Any(k => Math.Abs(k - z) < GeomTolFt)) continue;
+                corbelRefs.Add(c.Item1);
+                keptZ.Add(z);
             }
 
-            // Split Hooks into Top Hook (Tier 1) and Lower Hooks (Tier 2)
+            // Split hooks into the topmost hook (Tier 1) and the lower hooks (Tier 2)
             if (tempHooks.Count > 0)
             {
                 var sortedHooks = tempHooks.OrderByDescending(h => h.Item2).ToList();
                 topHookRef.Add(sortedHooks[0].Item1);
-                
+
                 double lastZ = sortedHooks[0].Item2;
                 for (int i = 1; i < sortedHooks.Count; i++)
                 {
@@ -463,64 +868,56 @@ namespace StructAutoDetailing
                     }
                 }
             }
+
+            // Summary for the diagnostics dialog
+            _diag.AppendLine();
+            _diag.AppendLine($"Assembly members: {rebarCount} rebar, {corbelCount} corbel(s), {hookCount} hook(s), {dowelCount} dowel family instance(s).");
+            _diag.AppendLine($"Corbel planes kept after de-duplication: {corbelRefs.Count}. Hooks: {tempHooks.Count}. Bottom dowel found: {(extremeBottomDowel != null ? "yes" : "NO")}.");
+            if (dowelCount > 0)
+                _diag.AppendLine($"Dowel probe: lowest dowel bbox is {dowelLowestMm:0.#} mm from the column bottom (negative = below). " +
+                                 $"Horizontal faces: {dowelHorizFaces}, with usable references: {dowelHorizRefs}.");
+            _diag.AppendLine("Families in the assembly (non-column):");
+            foreach (var kv in roles.OrderBy(k => k.Value))
+                _diag.AppendLine($"  {kv.Key}  ->  {kv.Value}");
         }
-        private void HarvestRightViewZones(Document doc, View activeView, List<Element> elementsToProcess, double colBottomZ, double colTopZ, 
+
+        // =====================================================================
+        //  Right / Left elevation harvesting
+        // =====================================================================
+
+        private void HarvestRightViewZones(List<Element> elementsToProcess, double colBottomZ, double colTopZ,
             out List<Reference> rebarZoneRefs, out Reference extremeBottomDowel)
         {
             rebarZoneRefs = new List<Reference>();
             extremeBottomDowel = null;
             double absoluteLowestDowelZ = double.MaxValue;
 
-            XYZ viewUp = activeView.UpDirection;
-            Options geomOptions = new Options { ComputeReferences = true, View = activeView, IncludeNonVisibleObjects = true };
+            XYZ viewUp = _view.UpDirection;
+            Options geomOptions = new Options { ComputeReferences = true, View = _view, IncludeNonVisibleObjects = true };
             List<Tuple<Reference, double>> allRebarPlanes = new List<Tuple<Reference, double>>();
 
             foreach (Element elem in elementsToProcess)
             {
-                // FIXED: Explicit namespace to resolve CS0122 Inaccessible error
                 if (elem is Autodesk.Revit.DB.Structure.Rebar rebar)
                 {
                     GeometryElement geomElem = rebar.get_Geometry(geomOptions);
-                    if (geomElem != null)
+                    if (geomElem == null) continue;
+
+                    foreach (PlanarFace pf in GetHorizontalFaces(geomElem, viewUp))
                     {
-                        foreach (GeometryObject geomObj in geomElem)
-                        {
-                            IEnumerable<GeometryObject> objectsToCheck = new List<GeometryObject> { geomObj };
-                            if (geomObj is GeometryInstance geomInst) objectsToCheck = geomInst.GetInstanceGeometry();
-                            foreach (GeometryObject obj in objectsToCheck)
-                            {
-                                if (obj is Solid solid)
-                                {
-                                    foreach (Face face in solid.Faces)
-                                    {
-                                        if (face is PlanarFace planarFace && Math.Abs(planarFace.FaceNormal.DotProduct(viewUp)) > 0.99)
-                                        {
-                                            double z = planarFace.Origin.DotProduct(viewUp);
-                                            
-                                            if (z < (colTopZ - 0.05) && z > (colBottomZ + 0.05))
-                                            {
-                                                allRebarPlanes.Add(new Tuple<Reference, double>(planarFace.Reference, z));
-                                            }
-                                            
-                                            if (z < absoluteLowestDowelZ && z < (colBottomZ - 0.05))
-                                            {
-                                                absoluteLowestDowelZ = z;
-                                                extremeBottomDowel = planarFace.Reference;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        double z = pf.Origin.DotProduct(viewUp);
+                        if (z < (colTopZ - 0.05) && z > (colBottomZ + 0.05))
+                            allRebarPlanes.Add(new Tuple<Reference, double>(pf.Reference, z));
                     }
+
+                    TrackLowestDowel(geomElem, viewUp, colBottomZ, ref absoluteLowestDowelZ, ref extremeBottomDowel);
                 }
             }
 
-            var sortedPlanes = allRebarPlanes.OrderBy(p => p.Item2).ToList();
-            double lastZ = -9999;
-            foreach (var plane in sortedPlanes)
+            double lastZ = double.MinValue;
+            foreach (var plane in allRebarPlanes.OrderBy(p => p.Item2))
             {
-                if (Math.Abs(plane.Item2 - lastZ) > 10.0) 
+                if (lastZ == double.MinValue || Math.Abs(plane.Item2 - lastZ) > RebarZoneMinSeparationFt)
                 {
                     rebarZoneRefs.Add(plane.Item1);
                     lastZ = plane.Item2;
@@ -528,41 +925,36 @@ namespace StructAutoDetailing
             }
         }
 
-        private Reference[] GetLeftAndRightColumnFaces(Document doc, View activeView, FamilyInstance column)
+        // =====================================================================
+        //  Concrete face finders
+        // =====================================================================
+
+        private Reference[] GetLeftAndRightColumnFaces(View activeView, FamilyInstance column)
         {
-            Reference leftRef = null; Reference rightRef = null;
+            Reference leftRef = null, rightRef = null;
             Options geomOptions = new Options { ComputeReferences = true, View = activeView };
             GeometryElement geomElem = column.get_Geometry(geomOptions);
             if (geomElem == null) return new Reference[] { null, null };
 
             XYZ viewRight = activeView.RightDirection;
-            double maxLeftArea = -1.0; double maxRightArea = -1.0;
+            double maxLeftArea = -1.0, maxRightArea = -1.0;
 
-            foreach (GeometryObject geomObj in geomElem)
+            foreach (Solid solid in GetSolids(geomElem))
             {
-                IEnumerable<GeometryObject> objectsToCheck = new List<GeometryObject> { geomObj };
-                if (geomObj is GeometryInstance geomInst) objectsToCheck = geomInst.GetInstanceGeometry();
-                
-                foreach (GeometryObject obj in objectsToCheck)
+                foreach (Face face in solid.Faces)
                 {
-                    if (obj is Solid solid)
+                    if (face is PlanarFace pf)
                     {
-                        foreach (Face face in solid.Faces)
-                        {
-                            if (face is PlanarFace planarFace)
-                            {
-                                double dot = planarFace.FaceNormal.DotProduct(viewRight);
-                                if (dot < -0.95 && planarFace.Area > maxLeftArea) { maxLeftArea = planarFace.Area; leftRef = planarFace.Reference; }
-                                else if (dot > 0.95 && planarFace.Area > maxRightArea) { maxRightArea = planarFace.Area; rightRef = planarFace.Reference; }
-                            }
-                        }
+                        double dot = pf.FaceNormal.DotProduct(viewRight);
+                        if (dot < -0.95 && pf.Area > maxLeftArea) { maxLeftArea = pf.Area; leftRef = pf.Reference; }
+                        else if (dot > 0.95 && pf.Area > maxRightArea) { maxRightArea = pf.Area; rightRef = pf.Reference; }
                     }
                 }
             }
             return new Reference[] { leftRef, rightRef };
         }
 
-        private Reference GetLowestColumnFace(Document doc, View activeView, FamilyInstance column)
+        private Reference GetLowestColumnFace(View activeView, FamilyInstance column)
         {
             Reference bottomRef = null;
             Options geomOptions = new Options { ComputeReferences = true, View = activeView };
@@ -572,30 +964,15 @@ namespace StructAutoDetailing
             XYZ viewUp = activeView.UpDirection;
             double minElevation = double.MaxValue;
 
-            foreach (GeometryObject geomObj in geomElem)
+            foreach (PlanarFace pf in GetHorizontalFaces(geomElem, viewUp, 0.95))
             {
-                IEnumerable<GeometryObject> objectsToCheck = new List<GeometryObject> { geomObj };
-                if (geomObj is GeometryInstance geomInst) objectsToCheck = geomInst.GetInstanceGeometry();
-                
-                foreach (GeometryObject obj in objectsToCheck)
-                {
-                    if (obj is Solid solid)
-                    {
-                        foreach (Face face in solid.Faces)
-                        {
-                            if (face is PlanarFace planarFace && Math.Abs(planarFace.FaceNormal.DotProduct(viewUp)) > 0.95)
-                            {
-                                double elevation = planarFace.Origin.DotProduct(viewUp);
-                                if (elevation < minElevation) { minElevation = elevation; bottomRef = planarFace.Reference; }
-                            }
-                        }
-                    }
-                }
+                double elevation = pf.Origin.DotProduct(viewUp);
+                if (elevation < minElevation) { minElevation = elevation; bottomRef = pf.Reference; }
             }
             return bottomRef;
         }
 
-        private Reference GetHighestColumnFace(Document doc, View activeView, FamilyInstance column)
+        private Reference GetHighestColumnFace(View activeView, FamilyInstance column)
         {
             Reference topRef = null;
             Options geomOptions = new Options { ComputeReferences = true, View = activeView };
@@ -605,25 +982,10 @@ namespace StructAutoDetailing
             XYZ viewUp = activeView.UpDirection;
             double maxElevation = double.MinValue;
 
-            foreach (GeometryObject geomObj in geomElem)
+            foreach (PlanarFace pf in GetHorizontalFaces(geomElem, viewUp, 0.95))
             {
-                IEnumerable<GeometryObject> objectsToCheck = new List<GeometryObject> { geomObj };
-                if (geomObj is GeometryInstance geomInst) objectsToCheck = geomInst.GetInstanceGeometry();
-                
-                foreach (GeometryObject obj in objectsToCheck)
-                {
-                    if (obj is Solid solid)
-                    {
-                        foreach (Face face in solid.Faces)
-                        {
-                            if (face is PlanarFace planarFace && Math.Abs(planarFace.FaceNormal.DotProduct(viewUp)) > 0.95)
-                            {
-                                double elevation = planarFace.Origin.DotProduct(viewUp);
-                                if (elevation > maxElevation) { maxElevation = elevation; topRef = planarFace.Reference; }
-                            }
-                        }
-                    }
-                }
+                double elevation = pf.Origin.DotProduct(viewUp);
+                if (elevation > maxElevation) { maxElevation = elevation; topRef = pf.Reference; }
             }
             return topRef;
         }
