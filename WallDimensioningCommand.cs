@@ -14,17 +14,19 @@ namespace StructAutoDetailing
     /// Smart dimensioning for precast walls / beams in a manually created
     /// Elevation, Section, Detail or Plan view.
     ///
-    /// Changes in this version:
-    ///  1. Skip logging: no empty catch blocks; a report lists every tier that was skipped and why.
+    /// Features:
+    ///  1. Skip logging: a report lists every tier that was skipped and why.
     ///  2. View-scale-aware tier spacing (identical to the old hard-coded values at 1:20).
-    ///  3. All horizontal steps (e.g. 1425 and 425 levels) are collected, so the
-    ///     "175 / 1000 / 425" split tier can be built.
-    ///  4. Temporary reference planes are used as a fallback when a direct reference is rejected,
-    ///     and for dowels in plan view (bars seen end-on).
-    ///  5. Tier labels (CMS 1, L1, LEDGE, T-25 DOWEL BAR, LENGTH) via TextNote.
-    ///  6. Stricter keyword matching (regex tokens for "25" and "L1").
-    ///  7. doc.Regenerate() before and after annotation (NFR-01).
-    ///  8. Embeds no longer influence the concrete boundary faces.
+    ///  3. Horizontal steps (e.g. 1425 / 425 levels) -> "175 / 1425" and "175 / 1000 / 425" tiers.
+    ///  4. Every tier runs in its own transaction; if Revit rejects it at commit only that tier is
+    ///     rolled back (no popup) and the tier is retried with marker fallbacks:
+    ///        direct references -> temporary reference planes -> invisible detail lines.
+    ///  5. Tier labels via TextNote.
+    ///  6. Strict keyword matching (regex tokens for "25" and "L1").
+    ///  7. SECTION / END-VIEW STANDARD (view looks along the member): horizontal strings are
+    ///        CMS 1 | T-25 DOWEL BAR | L1 | LEDGE (split across vertical steps) | WIDTH
+    ///     and only embeds that lie inside the view's depth range are dimensioned.
+    ///  8. Reference planes are regenerated before use (fixes "not geometric references").
     /// </summary>
     [Transaction(TransactionMode.Manual)]
     public class WallDimensioningCommand : IExternalCommand
@@ -34,8 +36,9 @@ namespace StructAutoDetailing
         private const double StepPerScale = 0.04;       // tier pitch ~12 mm on paper (0.8 ft at 1:20)
         private const double LabelGapPerScale = 0.05;   // label offset from the end of the concrete
         private const double DupTolerance = 0.15;       // ~45 mm: merge items closer than this
-        private const double StepMinGap = 0.15;         // ignore horizontal faces this close to top/bottom
-        private const double MinStepAreaSqFt = 1.0;     // ignore tiny horizontal faces (embed caps etc.)
+        private const double StepMinGap = 0.15;         // ignore faces this close to top/bottom/left/right
+        private const double MinStepAreaSqFt = 1.0;     // ignore tiny faces (embed caps etc.)
+        private const double DepthTolerance = 0.05;     // ft tolerance for the view-depth test
 
         private static readonly Regex Dia25 = new Regex(@"(^|[^0-9])25([^0-9]|$)");
         private static readonly Regex TokenL1 = new Regex(@"(^|[^A-Z0-9])L1($|[^A-Z0-9])");
@@ -45,17 +48,20 @@ namespace StructAutoDetailing
         private View _view;
         private XYZ _up, _right;
         private bool _isPlan;
+        private bool _sectionStyle;          // view looks along the member's long axis
         private int _scale = 20;
         private TextNoteType _textType;
-        private bool _labelWarned;
+        private GraphicsStyle _invisibleStyle;
+        private bool _labelWarned, _invisibleWarned;
+        private int _markerMode;             // 0 = reference planes, 1 = invisible detail lines
+        private int _outsideDepth;
         private int _created, _labels;
         private readonly List<string> _skipped = new List<string>();
         private readonly List<string> _notes = new List<string>();
 
         /// <summary>
-        /// Revit validates dimension references only at regeneration/commit. If a dimension ends up with
-        /// invalid references, delete just that dimension (instead of showing the blocking error dialog)
-        /// and record it for the report.
+        /// Revit validates dimension references only at regeneration/commit. If an attempt ends in an
+        /// error, roll back just that attempt (no popup) and remember the reason.
         /// </summary>
         private class RollbackOnError : IFailuresPreprocessor
         {
@@ -80,6 +86,7 @@ namespace StructAutoDetailing
             }
         }
 
+        /// <summary>A planar face level. Z holds the coordinate along the relevant view axis (up or right).</summary>
         private class StepPlane
         {
             public Reference Ref;
@@ -101,7 +108,8 @@ namespace StructAutoDetailing
             public List<XYZ> CmsPts = new List<XYZ>();
             public List<XYZ> LifterPts = new List<XYZ>();
             public List<XYZ> DowelPts = new List<XYZ>();
-            public List<StepPlane> Steps = new List<StepPlane>();   // sorted high -> low, excludes top & bottom
+            public List<StepPlane> Steps = new List<StepPlane>();    // horizontal faces, high -> low, excl. top/bottom
+            public List<StepPlane> XSteps = new List<StepPlane>();   // vertical faces, left -> right, excl. left/right
         }
 
         // =====================================================================
@@ -122,7 +130,8 @@ namespace StructAutoDetailing
             }
 
             _skipped.Clear(); _notes.Clear();
-            _created = 0; _labels = 0; _labelWarned = false;
+            _created = 0; _labels = 0; _outsideDepth = 0;
+            _labelWarned = false; _invisibleWarned = false; _markerMode = 0;
 
             try
             {
@@ -139,6 +148,7 @@ namespace StructAutoDetailing
                 _right = _view.RightDirection;
                 _isPlan = Math.Abs(_view.ViewDirection.DotProduct(XYZ.BasisZ)) > 0.95;
                 _scale = Math.Max(1, _view.Scale);
+                _sectionStyle = DetectSectionStyle(selected);
 
                 Harvest h = HarvestGeometry(selected);
 
@@ -148,8 +158,16 @@ namespace StructAutoDetailing
                     return Result.Failed;
                 }
 
+                if (_outsideDepth > 0)
+                    _notes.Add(_outsideDepth + " embed/dowel position(s) lie outside this view's depth range and were ignored.");
+
                 _textType = new FilteredElementCollector(_doc)
                     .OfClass(typeof(TextNoteType)).Cast<TextNoteType>().FirstOrDefault();
+
+                _invisibleStyle = new FilteredElementCollector(_doc)
+                    .OfClass(typeof(GraphicsStyle)).Cast<GraphicsStyle>()
+                    .FirstOrDefault(g => g.GraphicsStyleCategory != null
+                                         && g.GraphicsStyleCategory.Name == "<Invisible lines>");
 
                 // One group = one undo step; every tier runs in its own transaction (see Attempt)
                 using (TransactionGroup tg = new TransactionGroup(_doc, "Multi-Tier Smart Dimensioning"))
@@ -171,6 +189,36 @@ namespace StructAutoDetailing
             }
         }
 
+        /// <summary>True when the view looks along the member's long axis (e.g. "Elevation Right" of a beam).</summary>
+        private bool DetectSectionStyle(Element root)
+        {
+            if (_isPlan) return false;
+            try
+            {
+                BoundingBoxXYZ bb = root.get_BoundingBox(null);
+                if (bb == null) return false;
+                XYZ d = _view.ViewDirection;
+                XYZ ext = bb.Max - bb.Min;
+                double depth = Math.Abs(d.X) * ext.X + Math.Abs(d.Y) * ext.Y + Math.Abs(d.Z) * ext.Z;
+                double horiz = Math.Abs(_right.X) * ext.X + Math.Abs(_right.Y) * ext.Y + Math.Abs(_right.Z) * ext.Z;
+                return depth > horiz * 1.5;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Is the point inside the view's crop-box depth range? (only used for section-style views)</summary>
+        private bool InViewDepth(XYZ p)
+        {
+            try
+            {
+                if (!_view.CropBoxActive) return true;
+                BoundingBoxXYZ cb = _view.CropBox;
+                XYZ local = cb.Transform.Inverse.OfPoint(p);
+                return local.Z >= cb.Min.Z - DepthTolerance && local.Z <= cb.Max.Z + DepthTolerance;
+            }
+            catch { return true; }
+        }
+
         // =====================================================================
         //  TIER BUILDERS
         // =====================================================================
@@ -183,6 +231,9 @@ namespace StructAutoDetailing
 
             XYZ topOrigin = topFace.Origin;
             double labelDx = (h.MaxX - topOrigin.DotProduct(_right)) + LabelGapPerScale * _scale;
+
+            if (_sectionStyle) { BuildSectionHorizontalTiers(h, topOrigin, labelDx); return; }
+
             int idx = 0;
 
             // --- CMS ---
@@ -191,7 +242,7 @@ namespace StructAutoDetailing
                 double d = Off(idx);
                 List<Reference> direct = h.CmsX.Count > 0 ? Chain(h.Left, h.CmsX, h.Right) : null;
                 if (TierFB("H: CMS 1", topOrigin + _up * d, _right, direct,
-                           PlaneChain(h.CmsPts, true, h.Left, h.Right),
+                           PlaneChain(h.CmsPts, true, h.Left, h.Right, null),
                            "CMS 1", LabelPoint(topOrigin, labelDx, d)))
                     idx++;
             }
@@ -203,7 +254,7 @@ namespace StructAutoDetailing
                 double d = Off(idx);
                 List<Reference> direct = h.LifterX.Count > 0 ? Chain(h.Left, h.LifterX, h.Right) : null;
                 if (TierFB("H: L1 (lifters)", topOrigin + _up * d, _right, direct,
-                           PlaneChain(h.LifterPts, true, h.Left, h.Right),
+                           PlaneChain(h.LifterPts, true, h.Left, h.Right, null),
                            "L1", LabelPoint(topOrigin, labelDx, d)))
                     idx++;
             }
@@ -224,7 +275,7 @@ namespace StructAutoDetailing
                 double d = Off(idx);
                 List<Reference> direct = h.DowelX.Count > 0 ? Chain(h.Left, h.DowelX, h.Right) : null;
                 if (TierFB("H: T-25 dowels", topOrigin + _up * d, _right, direct,
-                           PlaneChain(h.DowelPts, true, h.Left, h.Right),
+                           PlaneChain(h.DowelPts, true, h.Left, h.Right, null),
                            "T-25 DOWEL BAR", LabelPoint(topOrigin, labelDx, d)))
                     idx++;
             }
@@ -236,6 +287,80 @@ namespace StructAutoDetailing
                 TierFB("H: overall (LENGTH)", topOrigin + _up * d, _right,
                        Chain(h.Left, null, h.Right), null,
                        "LENGTH", LabelPoint(topOrigin, labelDx, d));
+            }
+        }
+
+        /// <summary>
+        /// Section / end-view standard, nearest tier first:
+        ///   CMS 1 | T-25 DOWEL BAR | L1 | LEDGE (split at every vertical step) | WIDTH (body width)
+        /// Assumes the stepped foot is on the left; "body left" = first vertical step plane from the left.
+        /// </summary>
+        private void BuildSectionHorizontalTiers(Harvest h, XYZ topOrigin, double labelDx)
+        {
+            int idx = 0;
+            Reference bodyLeft = h.XSteps.Count > 0 ? h.XSteps[0].Ref : null;
+            Reference innerLeft = bodyLeft ?? h.Left;
+
+            // --- CMS 1 ---
+            if (h.CmsX.Count > 0 || h.CmsPts.Count > 0)
+            {
+                double d = Off(idx);
+                List<Reference> direct = h.CmsX.Count > 0 ? Chain(innerLeft, h.CmsX, h.Right) : null;
+                if (TierFB("H(section): CMS 1", topOrigin + _up * d, _right, direct,
+                           PlaneChain(h.CmsPts, true, innerLeft, h.Right, null),
+                           "CMS 1", LabelPoint(topOrigin, labelDx, d)))
+                    idx++;
+            }
+            else _notes.Add("No CMS embeds inside this view - CMS 1 tier not created.");
+
+            // --- T-25 DOWEL BAR (foot-left, dowels, body-left, right) ---
+            if (h.DowelX.Count > 0 || h.DowelPts.Count > 0)
+            {
+                double d = Off(idx);
+                List<Reference> direct = null;
+                if (h.DowelX.Count > 0)
+                {
+                    var mids = new List<Reference>(h.DowelX);
+                    if (bodyLeft != null) mids.Add(bodyLeft);
+                    direct = Chain(h.Left, mids, h.Right);
+                }
+                if (TierFB("H(section): T-25 dowels", topOrigin + _up * d, _right, direct,
+                           PlaneChain(h.DowelPts, true, h.Left, h.Right, bodyLeft),
+                           "T-25 DOWEL BAR", LabelPoint(topOrigin, labelDx, d)))
+                    idx++;
+            }
+            else _notes.Add("No dowels inside this view - T-25 tier not created.");
+
+            // --- L1 ---
+            if (h.LifterX.Count > 0 || h.LifterPts.Count > 0)
+            {
+                double d = Off(idx);
+                List<Reference> direct = h.LifterX.Count > 0 ? Chain(innerLeft, h.LifterX, h.Right) : null;
+                if (TierFB("H(section): L1", topOrigin + _up * d, _right, direct,
+                           PlaneChain(h.LifterPts, true, innerLeft, h.Right, null),
+                           "L1", LabelPoint(topOrigin, labelDx, d)))
+                    idx++;
+            }
+            else _notes.Add("No lifters inside this view - L1 tier not created.");
+
+            // --- LEDGE: left, every vertical step, right  (e.g. 200 / 75 / 325) ---
+            if (h.XSteps.Count > 0)
+            {
+                double d = Off(idx);
+                if (TierFB("H(section): LEDGE split", topOrigin + _up * d, _right,
+                           Chain(h.Left, h.XSteps.Select(s => s.Ref), h.Right),
+                           StepXChain(h.XSteps, topOrigin, h.Left, h.Right),
+                           "LEDGE", LabelPoint(topOrigin, labelDx, d)))
+                    idx++;
+            }
+            else _notes.Add("No vertical steps found in this view - LEDGE split tier not created.");
+
+            // --- WIDTH (body width) ---
+            {
+                double d = Off(idx);
+                TierFB("H(section): WIDTH", topOrigin + _up * d, _right,
+                       Chain(innerLeft, null, h.Right), null,
+                       "WIDTH", LabelPoint(topOrigin, labelDx, d));
             }
         }
 
@@ -260,7 +385,7 @@ namespace StructAutoDetailing
                 {
                     List<Reference> direct = h.CmsY.Count > 0 ? Chain(h.Bottom, h.CmsY, h.Top) : null;
                     if (TierFB("V(plan): CMS", leftOrigin - _right * Off(v), _up, direct,
-                               PlaneChain(h.CmsPts, false, h.Bottom, h.Top), null, null))
+                               PlaneChain(h.CmsPts, false, h.Bottom, h.Top, null), null, null))
                         v++;
                 }
 
@@ -268,7 +393,7 @@ namespace StructAutoDetailing
                 {
                     List<Reference> direct = h.LifterY.Count > 0 ? Chain(h.Bottom, h.LifterY, h.Top) : null;
                     if (TierFB("V(plan): lifters", leftOrigin - _right * Off(v), _up, direct,
-                               PlaneChain(h.LifterPts, false, h.Bottom, h.Top), null, null))
+                               PlaneChain(h.LifterPts, false, h.Bottom, h.Top, null), null, null))
                         v++;
                 }
 
@@ -350,8 +475,8 @@ namespace StructAutoDetailing
 
         /// <summary>
         /// Runs 'body' in its own transaction. Returns null on success, otherwise the reason.
-        /// Revit validates dimension references at commit; if it objects, only this attempt
-        /// (dimension, label and any temporary reference planes) is rolled back and no popup is shown.
+        /// If Revit objects at commit, only this attempt (dimension, label, temporary markers)
+        /// is rolled back and no popup is shown.
         /// </summary>
         private string Attempt(string name, Func<string> body)
         {
@@ -400,6 +525,9 @@ namespace StructAutoDetailing
             return null;
         }
 
+        /// <summary>
+        /// Tier with fallbacks: direct references -> reference planes -> invisible detail lines.
+        /// </summary>
         private bool TierFB(string name, XYZ start, XYZ dir, List<Reference> direct,
                             Func<List<Reference>> fallback, string label, XYZ labelPt)
         {
@@ -413,19 +541,26 @@ namespace StructAutoDetailing
 
             if (fallback != null)
             {
-                string err2 = Attempt(name + " [ref planes]", () =>
+                string[] modeNames = { "reference planes", "invisible detail lines" };
+                for (int mode = 0; mode < modeNames.Length; mode++)
                 {
-                    List<Reference> fb = fallback();
-                    if (fb == null) return "no reference planes could be built";
-                    return PlaceTier(start, dir, fb, label, labelPt);
-                });
+                    _markerMode = mode;
+                    string e2 = Attempt(name + " [" + modeNames[mode] + "]", () =>
+                    {
+                        List<Reference> fb = fallback();
+                        if (fb == null) return "no markers could be built";
+                        return PlaceTier(start, dir, fb, label, labelPt);
+                    });
 
-                if (err2 == null)
-                {
-                    _notes.Add(name + ": direct references failed (" + err + "); used temporary reference planes (PPS_TMP_*).");
-                    return true;
+                    if (e2 == null)
+                    {
+                        _markerMode = 0;
+                        _notes.Add(name + ": direct references failed (" + err + "); used " + modeNames[mode] + ".");
+                        return true;
+                    }
+                    err += " | " + modeNames[mode] + ": " + e2;
                 }
-                err += " | fallback: " + err2;
+                _markerMode = 0;
             }
 
             _skipped.Add(name + ": " + err);
@@ -465,14 +600,21 @@ namespace StructAutoDetailing
         }
 
         // =====================================================================
-        //  TEMPORARY REFERENCE PLANES
+        //  MARKERS (reference planes / invisible detail lines)
         // =====================================================================
+        /// <summary>Creates a marker through 'pt' running along 'lineDir' and returns its reference.</summary>
         private Reference RefPlaneAt(XYZ pt, XYZ lineDir)
+        {
+            return _markerMode == 0 ? RefPlaneMarker(pt, lineDir) : DetailLineMarker(pt, lineDir);
+        }
+
+        private Reference RefPlaneMarker(XYZ pt, XYZ lineDir)
         {
             try
             {
                 ReferencePlane rp = _doc.Create.NewReferencePlane(pt, pt + lineDir, _view.ViewDirection, _view);
                 try { rp.Name = "PPS_TMP_" + Guid.NewGuid().ToString("N").Substring(0, 6); } catch { }
+                _doc.Regenerate();      // the plane must exist in the graphics cache before it can be dimensioned
                 return rp.GetReference();
             }
             catch (Exception ex)
@@ -482,7 +624,32 @@ namespace StructAutoDetailing
             }
         }
 
-        /// <summary>Planes through each point. alongX=true: planes at distinct X (for horizontal strings).</summary>
+        private Reference DetailLineMarker(XYZ pt, XYZ lineDir)
+        {
+            try
+            {
+                XYZ p = OnViewPlane(pt);
+                Line ln = Line.CreateBound(p - lineDir * 0.5, p + lineDir * 0.5);
+                DetailCurve dc = _doc.Create.NewDetailCurve(_view, ln);
+
+                if (_invisibleStyle != null) dc.LineStyle = _invisibleStyle;
+                else if (!_invisibleWarned)
+                {
+                    _notes.Add("Detail-line markers are visible: no '<Invisible lines>' line style found in this project.");
+                    _invisibleWarned = true;
+                }
+
+                _doc.Regenerate();
+                return dc.GeometryCurve.Reference;
+            }
+            catch (Exception ex)
+            {
+                _skipped.Add("Detail line marker: " + FirstLine(ex.Message));
+                return null;
+            }
+        }
+
+        /// <summary>Markers through each point. alongX=true: distinct X positions (for horizontal strings).</summary>
         private List<Reference> PlanesFromPoints(List<XYZ> pts, bool alongX)
         {
             var result = new List<Reference>();
@@ -502,15 +669,18 @@ namespace StructAutoDetailing
             return result;
         }
 
-        private Func<List<Reference>> PlaneChain(List<XYZ> pts, bool alongX, Reference first, Reference last)
+        private Func<List<Reference>> PlaneChain(List<XYZ> pts, bool alongX, Reference first, Reference last, Reference extraMid)
         {
             return () =>
             {
                 List<Reference> planes = PlanesFromPoints(pts, alongX);
-                return planes.Count > 0 ? Chain(first, planes, last) : null;
+                if (planes.Count == 0) return null;
+                if (extraMid != null) planes.Add(extraMid);
+                return Chain(first, planes, last);
             };
         }
 
+        /// <summary>Markers at horizontal levels (steps along the up axis).</summary>
         private Func<List<Reference>> StepChain(List<StepPlane> steps, XYZ basePt, Reference first, Reference last)
         {
             return () =>
@@ -520,6 +690,23 @@ namespace StructAutoDetailing
                 {
                     XYZ pt = basePt + _up * (s.Z - basePt.DotProduct(_up));
                     Reference r = RefPlaneAt(pt, _right);
+                    if (r != null) l.Add(r);
+                }
+                l.Add(last);
+                return l.Count > 2 ? l : null;
+            };
+        }
+
+        /// <summary>Markers at vertical steps (positions along the right axis).</summary>
+        private Func<List<Reference>> StepXChain(List<StepPlane> steps, XYZ basePt, Reference first, Reference last)
+        {
+            return () =>
+            {
+                var l = new List<Reference> { first };
+                foreach (StepPlane s in steps)
+                {
+                    XYZ pt = basePt + _right * (s.Z - basePt.DotProduct(_right));
+                    Reference r = RefPlaneAt(pt, _up);
                     if (r != null) l.Add(r);
                 }
                 l.Add(last);
@@ -553,6 +740,7 @@ namespace StructAutoDetailing
             var cmsY = new List<Tuple<Reference, double>>();
             var lifterY = new List<Tuple<Reference, double>>();
             var planes = new List<StepPlane>();
+            var xplanes = new List<StepPlane>();
 
             var elems = new List<Element>();
             if (root is AssemblyInstance asm)
@@ -610,6 +798,9 @@ namespace StructAutoDetailing
                             if (bb != null) pt = (bb.Min + bb.Max) * 0.5;
                         }
 
+                        // Section-style views only show what the cut plane actually passes through
+                        if (_sectionStyle && !InViewDepth(pt)) { _outsideDepth++; continue; }
+
                         double xVal = pt.DotProduct(_right);
                         double yVal = pt.DotProduct(_up);
 
@@ -619,7 +810,7 @@ namespace StructAutoDetailing
                         // A family's centre planes are only usable if they are perpendicular to the
                         // direction being dimensioned in THIS view; otherwise Revit invalidates the
                         // dimension at commit. When misaligned we skip the direct reference and the
-                        // tier falls back to temporary reference planes built from the embed point.
+                        // tier falls back to markers built from the embed point.
                         bool alignX = Math.Abs(fi.HandOrientation.DotProduct(_right)) > 0.95;
                         bool alignY = Math.Abs(fi.FacingOrientation.DotProduct(_up)) > 0.95;
 
@@ -677,6 +868,10 @@ namespace StructAutoDetailing
                                     double x = pf.Origin.DotProduct(_right);
                                     if (x < h.MinX) { h.MinX = x; h.Left = pf.Reference; }
                                 }
+
+                                // every sizeable vertical face is a candidate "vertical step" (section standard)
+                                if ((rightDot > 0.95 || rightDot < -0.95) && pf.Area > MinStepAreaSqFt)
+                                    xplanes.Add(new StepPlane { Ref = pf.Reference, Z = pf.Origin.DotProduct(_right), FromView = true });
                             }
                         }
                     }
@@ -701,7 +896,7 @@ namespace StructAutoDetailing
                 }
             }
 
-            // ---------- Steps: unique levels strictly between bottom and top ----------
+            // ---------- Horizontal steps: unique levels strictly between bottom and top ----------
             if (h.MaxZ > double.MinValue && h.MinZ < double.MaxValue)
             {
                 h.Steps = planes
@@ -709,6 +904,17 @@ namespace StructAutoDetailing
                     .Select(g => g.OrderByDescending(p => p.FromView).First())   // prefer view-valid reference
                     .Where(p => h.MaxZ - p.Z > StepMinGap && p.Z - h.MinZ > StepMinGap)
                     .OrderByDescending(p => p.Z)
+                    .ToList();
+            }
+
+            // ---------- Vertical steps: unique positions strictly between left and right ----------
+            if (h.MaxX > double.MinValue && h.MinX < double.MaxValue)
+            {
+                h.XSteps = xplanes
+                    .GroupBy(p => Math.Round(p.Z, 2))
+                    .Select(g => g.First())
+                    .Where(p => p.Z - h.MinX > StepMinGap && h.MaxX - p.Z > StepMinGap)
+                    .OrderBy(p => p.Z)
                     .ToList();
             }
 
@@ -730,7 +936,7 @@ namespace StructAutoDetailing
             string n = type.Name.ToUpperInvariant();
             if (!(n.Contains("DOWEL") || Dia25.IsMatch(n))) return;
 
-            // Centre point of every bar position (needed for plan view, where dowels are seen end-on)
+            // Centre point of every bar position (needed where dowels are seen end-on)
             try
             {
                 int count = Math.Max(1, rebar.NumberOfBarPositions);
@@ -744,7 +950,10 @@ namespace StructAutoDetailing
                     Curve pick = cs.FirstOrDefault(c => c is Line && Math.Abs(((Line)c).Direction.DotProduct(_view.ViewDirection)) > 0.95)
                               ?? cs.FirstOrDefault(c => c is Line && Math.Abs(((Line)c).Direction.DotProduct(_up)) > 0.95)
                               ?? cs.First();
-                    h.DowelPts.Add((pick.GetEndPoint(0) + pick.GetEndPoint(1)) * 0.5);
+                    XYZ pt = (pick.GetEndPoint(0) + pick.GetEndPoint(1)) * 0.5;
+
+                    if (_sectionStyle && !InViewDepth(pt)) { _outsideDepth++; continue; }
+                    h.DowelPts.Add(pt);
                 }
             }
             catch (Exception ex) { _notes.Add("Dowel centre points skipped for one rebar: " + FirstLine(ex.Message)); }
@@ -854,7 +1063,8 @@ namespace StructAutoDetailing
             var sb = new StringBuilder();
             sb.AppendLine("Dimension strings created: " + _created);
             sb.AppendLine("Tier labels created: " + _labels);
-            sb.AppendLine("View: " + _view.Name + "  (scale 1:" + _scale + ", " + (_isPlan ? "plan" : "elevation/section") + ")");
+            sb.AppendLine("View: " + _view.Name + "  (scale 1:" + _scale + ", "
+                          + (_isPlan ? "plan" : _sectionStyle ? "section / end view" : "front elevation") + ")");
 
             if (_notes.Count > 0)
             {
