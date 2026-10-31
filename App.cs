@@ -14,23 +14,13 @@ namespace StructAutoDetailing
 
             string asm = Assembly.GetExecutingAssembly().Location;
 
-            // 1. COLUMN PANEL - one drop-down with a sub-item per view type
+            // 1. COLUMN PANEL - one button for every column view (elevation and section).
+            //    A pop-up lists the dimensions that fit the active view.
             RibbonPanel columnPanel = application.CreateRibbonPanel(tabName, "Smart Column Dimensioning");
-            PulldownButtonData columnMenu = new PulldownButtonData("ddSmartColumn", "Smart Column\nDimensioning");
-            if (columnPanel.AddItem(columnMenu) is PulldownButton columnButton)
-            {
-                columnButton.ToolTip = "Dimension a precast column assembly - choose the view type.";
-
-                AddMenuItem(columnButton, asm,
-                    "cmdSmartDim", "Elevation View Dimensioning",
-                    "StructAutoDetailing.SmartDimensioningCommand",
-                    "Add standard multi-tier dimensions to a column assembly elevation view.");
-
-                AddMenuItem(columnButton, asm,
-                    "cmdSmartColumnSectionDim", "Section View Dimensioning",
-                    "StructAutoDetailing.ColumnSectionDimensioningCommand",
-                    "Dimension a column section view: overall size and the centres of the corrugated metal sleeves (CMS 1, CMS 2).");
-            }
+            AddButton(columnPanel, asm,
+                "cmdSmartColumnDim", "Smart Column\nDimensioning",
+                "StructAutoDetailing.ColumnSectionDimensioningCommand",
+                "Dimension a precast column assembly view (elevation or section). Choose the dimensions in the pop-up, then pick the column.");
 
             // 2. STRUCTURAL FRAMING PANEL (was "Smart Beam Dimensioning")
             RibbonPanel framingPanel = application.CreateRibbonPanel(tabName, "Structural Framing Dimensioning");
@@ -57,14 +47,6 @@ namespace StructAutoDetailing
             var data = new PushButtonData(internalName, text, assemblyPath, className);
             if (panel.AddItem(data) is PushButton btn)
                 btn.ToolTip = tooltip;
-        }
-
-        private static void AddMenuItem(PulldownButton menu, string assemblyPath,
-            string internalName, string text, string className, string tooltip)
-        {
-            var data = new PushButtonData(internalName, text, assemblyPath, className);
-            PushButton btn = menu.AddPushButton(data);
-            if (btn != null) btn.ToolTip = tooltip;
         }
     }
 }
