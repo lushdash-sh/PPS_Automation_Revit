@@ -1,0 +1,11 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Temporary files
+*.log
