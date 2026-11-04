@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "HXtduo78Jdo=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\Kaustav\\Desktop\\3rd Year\\EDI\\PPS_Automation_Revit\\StructAutoDetailing.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Kaustav\\.nuget\\packages\\microsoft.netframework.referenceassemblies\\1.0.3\\microsoft.netframework.referenceassemblies.1.0.3.nupkg.sha512",
+    "C:\\Users\\Kaustav\\.nuget\\packages\\microsoft.netframework.referenceassemblies.net48\\1.0.3\\microsoft.netframework.referenceassemblies.net48.1.0.3.nupkg.sha512"
+  ],
+  "logs": []
+}
